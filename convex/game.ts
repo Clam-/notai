@@ -992,9 +992,6 @@ export const startNextWord = mutation({
     const session = await getSession(ctx);
     const startingWord = args.startingWord.trim();
     const seedKind = cleanSeedKind(args.seedKind);
-    if (!startingWord) {
-      throw new Error(seedKind === "topic" ? "Topic is required" : "Starting word is required");
-    }
 
     await deleteEntries(ctx, await ctx.db.query("entries").collect());
     await ctx.db.patch(session._id, {

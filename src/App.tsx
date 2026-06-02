@@ -672,7 +672,7 @@ function SegmentPopup({ segment }: { segment: OutputSegment }) {
             key={`${choice.userName}-${choice.word}-${index}`}
           >
             <span>
-              {choice.userName} - {choice.word}
+              {choice.word} - {choice.userName}
             </span>
             <span>
               ({choice.count}/{choice.total} {choice.percent}%)
@@ -1200,7 +1200,7 @@ function OutputPreview({
   emptyText?: string;
 }) {
   if (!visible) {
-    return <h1>Progress hidden</h1>;
+    return <span></span>;
   }
 
   if (!output.trim()) {
@@ -1273,7 +1273,7 @@ function LiveAdminSummary({ session, state }: { session: AdminSession; state: Ad
         <>
           <div className="summary-preview">
             <p className="eyebrow">{nextWordPrompt(session).label}</p>
-            <h1>{currentVisible ? nextWordPrompt(session).text : "Progress hidden"}</h1>
+            <h1>{currentVisible ? nextWordPrompt(session).text : ""}</h1>
           </div>
           <div className="summary-preview">
             <p className="eyebrow">Current cumulative</p>

@@ -534,10 +534,11 @@ label {
 
 .attributed-output {
   display: block;
+  position: relative;
 }
 
 .output-segment-wrap {
-  position: relative;
+  position: static;
   display: inline;
 }
 
@@ -571,7 +572,7 @@ label {
   bottom: calc(100% + 10px);
   z-index: 10;
   width: max-content;
-  max-width: min(420px, 82vw);
+  max-width: min(420px, calc(100vw - 32px));
   border: 1px solid #27364a;
   border-radius: 7px;
   background: #101820;
@@ -752,6 +753,30 @@ label {
 }
 
 @media (max-width: 780px) {
+  .segment-popup {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    left: 16px;
+    width: auto;
+    max-width: none;
+    transform: translateY(8px);
+  }
+
+  .next-word-popup {
+    min-width: 0;
+    max-height: min(360px, 60vh);
+  }
+
+  .segment-popup::after {
+    display: none;
+  }
+
+  .output-segment:hover + .segment-popup,
+  .output-segment:focus-visible + .segment-popup {
+    transform: translateY(0);
+  }
+
   .app-shell {
     padding: 22px;
   }
