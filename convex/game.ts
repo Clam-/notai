@@ -20,6 +20,14 @@ type OutputSegment = {
   roundNumber: number;
   mode: "admin" | "nextWord" | "followMe";
   authors: string[];
+  choices: {
+    userName: string;
+    word: string;
+    count: number;
+    total: number;
+    percent: number;
+    picked: boolean;
+  }[];
   summary: string;
 };
 
@@ -224,6 +232,51 @@ function namesForWinningWord(
   return [...new Set(names)];
 }
 
+function nextWordChoicesForRound(
+  entries: EntryDoc[],
+  winningWord: string,
+  userNameById: Map<Id<"users">, string>,
+) {
+  const submissions = entries.flatMap((entry) =>
+    entry.words
+      .map((word) => word.trim())
+      .filter(Boolean)
+      .map((word) => ({
+        userName: userName(userNameById, entry.userId),
+        word,
+      })),
+  );
+  const total = submissions.length;
+  const counts = submissions.reduce((nextCounts, submission) => {
+    const key = submission.word.toLocaleLowerCase();
+    nextCounts.set(key, (nextCounts.get(key) ?? 0) + 1);
+    return nextCounts;
+  }, new Map<string, number>());
+  const winningKey = winningWord.toLocaleLowerCase();
+
+  return submissions
+    .map((submission) => {
+      const key = submission.word.toLocaleLowerCase();
+      const count = counts.get(key) ?? 0;
+      return {
+        ...submission,
+        count,
+        total,
+        percent: total > 0 ? Math.round((count / total) * 100) : 0,
+        picked: key === winningKey,
+      };
+    })
+    .sort((a, b) => {
+      if (b.count !== a.count) {
+        return b.count - a.count;
+      }
+      if (a.picked !== b.picked) {
+        return a.picked ? -1 : 1;
+      }
+      return `${a.word} ${a.userName}`.localeCompare(`${b.word} ${b.userName}`);
+    });
+}
+
 function wordCountForEntry(entry: EntryDoc) {
   return (entry.text || entry.words.join(" ")).trim().split(/\s+/).filter(Boolean).length;
 }
@@ -352,6 +405,7 @@ async function outputSegmentsForSession(
             roundNumber: 0,
             mode: "admin",
             authors: ["Admin"],
+            choices: [],
             summary: "Initial context added by Admin",
           },
         ]
@@ -366,6 +420,7 @@ async function outputSegmentsForSession(
           roundNumber: entry.roundNumber,
           mode: "followMe",
           authors: [author],
+          choices: [],
           summary: `Round ${entry.roundNumber}: ${wordCount} ${wordCount === 1 ? "word" : "words"} added by ${author}`,
         };
       }),
@@ -375,7 +430,19 @@ async function outputSegmentsForSession(
   }
 
   if (session.mode === "nextWord") {
-    const winners = includedNextWordWinners(output, recentEntries);
+    let winners = includedNextWordWinners(output, recentEntries);
+    if (session.seedKind !== "topic") {
+      while (winners.length > 0) {
+        const candidateText = winners.map((winner) => winner.word).join(" ");
+        const prefixLength = output.endsWith(` ${candidateText}`)
+          ? output.length - candidateText.length
+          : -1;
+        if (prefixLength > 0 && output.slice(0, prefixLength).trim()) {
+          break;
+        }
+        winners = winners.slice(0, -1);
+      }
+    }
     const appendedText = winners.map((winner) => winner.word).join(" ");
     const startingText = appendedText ? output.slice(0, output.length - appendedText.length).trim() : output;
     const segments: OutputSegment[] = session.seedKind === "topic"
@@ -387,6 +454,7 @@ async function outputSegmentsForSession(
             roundNumber: 0,
             mode: "admin",
             authors: ["Admin"],
+            choices: [],
             summary: "Starting word added by Admin",
           },
         ]
@@ -398,15 +466,16 @@ async function outputSegmentsForSession(
       );
       const authors = namesForWinningWord(roundEntries, winner.word, userNameById);
       const authorText = authors.length > 0 ? authors.join(", ") : "Unknown participant";
-      const matchingEntries = roundEntries.filter((entry) =>
-        entry.words.some((word) => word.trim().toLocaleLowerCase() === winner.word.toLocaleLowerCase()),
-      ).length;
+      const choices = nextWordChoicesForRound(roundEntries, winner.word, userNameById);
+      const matchingEntries = choices.find((choice) => choice.picked)?.count ?? 0;
+      const totalChoices = choices[0]?.total ?? 0;
       segments.push({
         text: winner.word,
         roundNumber: winner.roundNumber,
         mode: "nextWord",
         authors,
-        summary: `Round ${winner.roundNumber}: winning word submitted by ${authorText}; ${matchingEntries}/${roundEntries.length} matching`,
+        choices,
+        summary: `Round ${winner.roundNumber}: winning word submitted by ${authorText}; ${matchingEntries}/${totalChoices} matching`,
       });
     });
 

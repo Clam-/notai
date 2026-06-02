@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, useEffect, useRef, useState, type CSSProperties } from "react";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "../convex/_generated/api";
 import type { Id } from "../convex/_generated/dataModel";
@@ -15,6 +15,16 @@ type AdminEntry = AdminState["entries"][number];
 type AdminPresence = AdminState["presences"][number];
 type OutputSegment = ParticipantState["outputSegments"][number] | AdminState["outputSegments"][number];
 type SeedKind = "startingWord" | "topic";
+type FollowPiece = {
+  text: string;
+  segment: OutputSegment;
+  endsSentence: boolean;
+};
+type FollowParagraph = FollowPiece[];
+type AuthorStyle = CSSProperties & {
+  "--author-color": string;
+  "--author-soft": string;
+};
 type WakeLockSentinel = EventTarget & {
   released: boolean;
   release: () => Promise<void>;
@@ -62,6 +72,60 @@ function visibleContext(context: string, wordsShownPerRound: number) {
 
 function countWords(text: string) {
   return text.trim().split(/\s+/).filter(Boolean).length;
+}
+
+function sentenceParts(text: string) {
+  const matches = text.match(/[^.!?]+[.!?]+(?:["')\]]+)?|[^.!?]+$/g);
+  return (matches ?? [text])
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .map((part) => ({
+      text: part,
+      endsSentence: /[.!?]+["')\]]*$/.test(part),
+    }));
+}
+
+function followParagraphs(segments: OutputSegment[]) {
+  const paragraphs: FollowParagraph[] = [[]];
+  let sentenceCount = 0;
+
+  segments.forEach((segment) => {
+    sentenceParts(segment.text).forEach((part) => {
+      const paragraph = paragraphs[paragraphs.length - 1];
+      paragraph.push({ ...part, segment });
+      sentenceCount += part.endsSentence ? 1 : 0;
+      if (sentenceCount >= 2) {
+        paragraphs.push([]);
+        sentenceCount = 0;
+      }
+    });
+  });
+
+  return paragraphs.filter((paragraph) => paragraph.length > 0);
+}
+
+function hashString(text: string) {
+  let hash = 0;
+  for (let index = 0; index < text.length; index += 1) {
+    hash = (hash * 31 + text.charCodeAt(index)) >>> 0;
+  }
+  return hash;
+}
+
+function authorColor(author: string) {
+  const hue = hashString(author) % 360;
+  return {
+    color: `hsl(${hue} 62% 42%)`,
+    soft: `hsl(${hue} 74% 94%)`,
+  };
+}
+
+function authorStyle(author: string): AuthorStyle {
+  const color = authorColor(author);
+  return {
+    "--author-color": color.color,
+    "--author-soft": color.soft,
+  };
 }
 
 function seedKindForSession(session: { seedKind?: SeedKind } | null | undefined): SeedKind {
@@ -489,14 +553,21 @@ function OutputPanel({
     <div className="status-panel output">
       <p className="eyebrow">Final output</p>
       {topic ? <ContextBlock label="Topic" context={topic} /> : null}
-      {output ? (
-        <h1 className="attributed-output">
-          <AttributedOutputText output={output} segments={visibleSegments} />
-        </h1>
-      ) : (
-        <h1>No words were entered.</h1>
-      )}
+      {output ? <OutputContent output={output} segments={visibleSegments} /> : <h1>No words were entered.</h1>}
     </div>
+  );
+}
+
+function OutputContent({ output, segments }: { output: string; segments: OutputSegment[] }) {
+  const visibleSegments = segments.filter((segment) => segment.text.trim());
+  if (visibleSegments.some((segment) => segment.mode === "followMe")) {
+    return <FollowMeOutput segments={visibleSegments} />;
+  }
+
+  return (
+    <h1 className="attributed-output">
+      <AttributedOutputText output={output} segments={visibleSegments} />
+    </h1>
   );
 }
 
@@ -511,16 +582,116 @@ function AttributedOutputText({ output, segments }: { output: string; segments: 
     <>
       {visibleSegments.map((segment, index) => (
         <span className="output-segment-wrap" key={`${segment.roundNumber}-${index}-${segment.text}`}>
-          <span className="output-segment" tabIndex={0} aria-label={segment.summary}>
+          <span
+            className={`output-segment ${segment.mode === "nextWord" ? "output-segment-picked" : ""}`}
+            tabIndex={0}
+            aria-label={segment.summary}
+          >
             {segment.text}
           </span>
-          <span className="segment-popup" role="tooltip">
-            {segment.summary}
-          </span>
+          <SegmentPopup segment={segment} />
           {index < visibleSegments.length - 1 ? " " : null}
         </span>
       ))}
     </>
+  );
+}
+
+function SegmentPopup({ segment }: { segment: OutputSegment }) {
+  if (segment.mode === "nextWord" && segment.choices.length > 0) {
+    return (
+      <span className="segment-popup next-word-popup" role="tooltip">
+        <span className="popup-title">Round {segment.roundNumber}:</span>
+        {segment.choices.map((choice, index) => (
+          <span
+            className={`next-word-choice ${choice.picked ? "choice-picked" : "choice-unpicked"}`}
+            key={`${choice.userName}-${choice.word}-${index}`}
+          >
+            <span>
+              {choice.userName} - {choice.word}
+            </span>
+            <span>
+              ({choice.count}/{choice.total} {choice.percent}%)
+            </span>
+          </span>
+        ))}
+      </span>
+    );
+  }
+
+  return (
+    <span className="segment-popup" role="tooltip">
+      {segment.summary}
+    </span>
+  );
+}
+
+function FollowMeOutput({ segments }: { segments: OutputSegment[] }) {
+  const [activeAuthor, setActiveAuthor] = useState<string | null>(null);
+  const paragraphs = followParagraphs(segments);
+  const authors = [
+    ...new Map(
+      segments.map((segment) => {
+        const author = segment.authors[0] ?? "Unknown participant";
+        return [author, author] as const;
+      }),
+    ).values(),
+  ];
+  const activeClass = activeAuthor ? " follow-output-highlighting" : "";
+
+  return (
+    <div className={`follow-output${activeClass}`}>
+      <div className="follow-author-key" aria-label="Follow Me authors">
+        {authors.map((author) => (
+          <span
+            className={`follow-author-key-item ${
+              activeAuthor && activeAuthor !== author ? "follow-muted" : ""
+            } ${activeAuthor === author ? "follow-active" : ""}`}
+            style={authorStyle(author)}
+            tabIndex={0}
+            aria-label={`Highlight ${author}`}
+            key={author}
+            onBlur={() => setActiveAuthor(null)}
+            onFocus={() => setActiveAuthor(author)}
+            onMouseEnter={() => setActiveAuthor(author)}
+            onMouseLeave={() => setActiveAuthor(null)}
+          >
+            <span className="follow-author-swatch" />
+            {author}
+          </span>
+        ))}
+      </div>
+      <div className="follow-paragraphs">
+        {paragraphs.map((paragraph, paragraphIndex) => (
+          <p key={paragraph.map((piece) => piece.text).join(" ") || paragraphIndex}>
+            {paragraph.map((piece, pieceIndex) => {
+              const author = piece.segment.authors[0] ?? "Unknown participant";
+              const highlighted = activeAuthor === author;
+              const muted = Boolean(activeAuthor && !highlighted);
+              return (
+                <span key={`${piece.segment.roundNumber}-${pieceIndex}-${piece.text}`}>
+                  <span
+                    className={`follow-output-segment ${muted ? "follow-muted" : ""} ${
+                      highlighted ? "follow-active" : ""
+                    }`}
+                    style={authorStyle(author)}
+                    title={author}
+                    tabIndex={0}
+                    onBlur={() => setActiveAuthor(null)}
+                    onFocus={() => setActiveAuthor(author)}
+                    onMouseEnter={() => setActiveAuthor(author)}
+                    onMouseLeave={() => setActiveAuthor(null)}
+                  >
+                    {piece.text}
+                  </span>
+                  {pieceIndex < paragraph.length - 1 ? " " : null}
+                </span>
+              );
+            })}
+          </p>
+        ))}
+      </div>
+    </div>
   );
 }
 
@@ -902,7 +1073,7 @@ function CumulativeIcon({ slash = false }: { slash?: boolean }) {
   );
 }
 
-function PreviewText({
+function OutputPreview({
   visible,
   output,
   segments,
@@ -914,14 +1085,14 @@ function PreviewText({
   emptyText?: string;
 }) {
   if (!visible) {
-    return <>Progress hidden</>;
+    return <h1>Progress hidden</h1>;
   }
 
   if (!output.trim()) {
-    return <>{emptyText}</>;
+    return <h1>{emptyText}</h1>;
   }
 
-  return <AttributedOutputText output={output} segments={segments} />;
+  return <OutputContent output={output} segments={segments} />;
 }
 
 function LiveAdminSummary({ session, state }: { session: AdminSession; state: AdminState | undefined }) {
@@ -991,13 +1162,11 @@ function LiveAdminSummary({ session, state }: { session: AdminSession; state: Ad
           </div>
           <div className="summary-preview">
             <p className="eyebrow">Current cumulative</p>
-            <h1 className="attributed-output">
-              <PreviewText
-                visible={cumulativeVisible}
-                output={session.context}
-                segments={outputSegments}
-              />
-            </h1>
+            <OutputPreview
+              visible={cumulativeVisible}
+              output={session.context}
+              segments={outputSegments}
+            />
           </div>
           <p>
             {ready}/{activeJoined.length} online ready
@@ -1007,13 +1176,11 @@ function LiveAdminSummary({ session, state }: { session: AdminSession; state: Ad
         <>
           <div className="summary-preview">
             <p className="eyebrow">Current cumulative</p>
-            <h1 className="attributed-output">
-              <PreviewText
-                visible={cumulativeVisible}
-                output={session.context}
-                segments={outputSegments}
-              />
-            </h1>
+            <OutputPreview
+              visible={cumulativeVisible}
+              output={session.context}
+              segments={outputSegments}
+            />
           </div>
           <p>Round {session.roundNumber}</p>
         </>
