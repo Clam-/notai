@@ -221,6 +221,7 @@ function useScreenWakeLock(clientId: string, enabled: boolean) {
     let cancelled = false;
     let sentinel: WakeLockSentinel | null = null;
     let retryTimer: number | undefined;
+    let requestInFlight = false;
     const report = (
       status: "active" | "unsupported" | "failed" | "released" | "inactive",
       message: string | null,
@@ -247,6 +248,10 @@ function useScreenWakeLock(clientId: string, enabled: boolean) {
       if (sentinel && !sentinel.released) {
         return;
       }
+      if (requestInFlight) {
+        return;
+      }
+      requestInFlight = true;
       try {
         sentinel = await wakeLock.request("screen");
         report("active", null);
@@ -260,10 +265,17 @@ function useScreenWakeLock(clientId: string, enabled: boolean) {
       } catch (err) {
         sentinel = null;
         report("failed", wakeLockErrorMessage(err));
+      } finally {
+        requestInFlight = false;
       }
     };
     const retryWhenActive = () => {
       if (document.visibilityState === "visible" && document.hasFocus() && !cancelled) {
+        void requestWakeLock();
+      }
+    };
+    const retryFromUserTap = () => {
+      if (document.visibilityState === "visible" && !cancelled) {
         void requestWakeLock();
       }
     };
@@ -272,6 +284,9 @@ function useScreenWakeLock(clientId: string, enabled: boolean) {
     window.addEventListener("focus", retryWhenActive);
     window.addEventListener("pageshow", retryWhenActive);
     document.addEventListener("visibilitychange", retryWhenActive);
+    document.addEventListener("pointerup", retryFromUserTap, { capture: true });
+    document.addEventListener("click", retryFromUserTap, { capture: true });
+    document.addEventListener("touchend", retryFromUserTap, { capture: true });
 
     return () => {
       cancelled = true;
@@ -279,6 +294,9 @@ function useScreenWakeLock(clientId: string, enabled: boolean) {
       window.removeEventListener("focus", retryWhenActive);
       window.removeEventListener("pageshow", retryWhenActive);
       document.removeEventListener("visibilitychange", retryWhenActive);
+      document.removeEventListener("pointerup", retryFromUserTap, { capture: true });
+      document.removeEventListener("click", retryFromUserTap, { capture: true });
+      document.removeEventListener("touchend", retryFromUserTap, { capture: true });
       report("inactive", null);
       void sentinel?.release();
       sentinel = null;
