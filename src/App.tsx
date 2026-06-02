@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery } from "convex/react";
 import { api } from "../convex/_generated/api";
 import type { Id } from "../convex/_generated/dataModel";
@@ -11,6 +11,7 @@ type ParticipantState = NonNullable<ReturnType<typeof useQuery<typeof api.game.g
 type AdminState = NonNullable<ReturnType<typeof useQuery<typeof api.game.getAdminState>>>;
 type AdminSession = AdminState["session"];
 type AdminEntry = AdminState["entries"][number];
+type OutputSegment = ParticipantState["outputSegments"][number] | AdminState["outputSegments"][number];
 
 function getClientId() {
   const existing = localStorage.getItem(CLIENT_ID_KEY);
@@ -65,6 +66,10 @@ export default function App() {
     void join({ clientId, name: savedName });
   }, [clientId, join, savedName, state?.user]);
 
+  if (adminOpen) {
+    return <AdminDashboard onClose={() => setAdminOpen(false)} />;
+  }
+
   return (
     <main className="app-shell">
       <button
@@ -90,8 +95,6 @@ export default function App() {
           <ParticipantView clientId={clientId} state={state} />
         )}
       </section>
-
-      {adminOpen ? <AdminDashboard onClose={() => setAdminOpen(false)} /> : null}
     </main>
   );
 }
@@ -149,21 +152,33 @@ function ParticipantView({
   const [choices, setChoices] = useState<string[]>([""]);
   const [followText, setFollowText] = useState("");
   const [error, setError] = useState("");
+  const nextWordInputRef = useRef<HTMLInputElement | null>(null);
+  const followMeTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const session = state?.session;
   const user = state?.user;
   const wordsPerRound = session?.wordsPerRound ?? 1;
 
   useEffect(() => {
-    setChoices((current) =>
-      Array.from({ length: wordsPerRound }, (_, index) => current[index] ?? ""),
-    );
+    setChoices(Array.from({ length: wordsPerRound }, () => ""));
   }, [session?.roundNumber, wordsPerRound]);
 
   useEffect(() => {
     setFollowText("");
     setError("");
   }, [session?.roundNumber]);
+
+  useEffect(() => {
+    if (session?.mode === "nextWord" && !state?.ownEntry) {
+      nextWordInputRef.current?.focus();
+    }
+  }, [session?.mode, session?.roundNumber, state?.ownEntry]);
+
+  useEffect(() => {
+    if (session?.mode === "followMe" && state?.isCurrentTurn) {
+      followMeTextareaRef.current?.focus();
+    }
+  }, [session?.mode, session?.roundNumber, state?.isCurrentTurn]);
 
   if (!state || !session) {
     return <StatusPanel title="Joining..." />;
@@ -178,7 +193,7 @@ function ParticipantView({
   }
 
   if (session.status === "ended") {
-    return <OutputPanel output={session.endedOutput} />;
+    return <OutputPanel output={session.endedOutput} segments={state.outputSegments} />;
   }
 
   if (session.mode === "nextWord") {
@@ -194,6 +209,7 @@ function ParticipantView({
           setError("");
           try {
             await submitNextWord({ clientId, words: choices });
+            setChoices(Array.from({ length: wordsPerRound }, () => ""));
           } catch (err) {
             setError(err instanceof Error ? err.message : "Could not submit.");
           }
@@ -206,6 +222,7 @@ function ParticipantView({
             <label key={`${session.roundNumber}-${index}`}>
               {choiceLabel(index, wordsPerRound)}
               <input
+                ref={index === 0 ? nextWordInputRef : undefined}
                 value={choice}
                 onChange={(event) => {
                   const next = [...choices];
@@ -255,6 +272,7 @@ function ParticipantView({
           setError("");
           try {
             await submitFollowMe({ clientId, text: followText });
+            setFollowText("");
           } catch (err) {
             setError(err instanceof Error ? err.message : "Could not submit.");
           }
@@ -264,6 +282,7 @@ function ParticipantView({
         <label>
           Next words:
           <textarea
+            ref={followMeTextareaRef}
             className={`tone-${currentTone}`}
             value={followText}
             onChange={(event) => setFollowText(event.target.value)}
@@ -292,11 +311,37 @@ function StatusPanel({ title }: { title: string }) {
   );
 }
 
-function OutputPanel({ output }: { output: string }) {
+function OutputPanel({ output, segments = [] }: { output: string; segments?: OutputSegment[] }) {
+  const visibleSegments = segments.filter((segment) => segment.text.trim());
+
   return (
     <div className="status-panel output">
       <p className="eyebrow">Final output</p>
-      <h1>{output || "No words were entered."}</h1>
+      {output ? (
+        <h1 className="attributed-output">
+          {visibleSegments.length > 0 ? (
+            visibleSegments.map((segment, index) => (
+              <span className="output-segment-wrap" key={`${segment.roundNumber}-${index}`}>
+                <span
+                  className="output-segment"
+                  tabIndex={0}
+                  aria-label={segment.summary}
+                >
+                  {segment.text}
+                </span>
+                <span className="segment-popup" role="tooltip">
+                  {segment.summary}
+                </span>
+                {index < visibleSegments.length - 1 ? " " : null}
+              </span>
+            ))
+          ) : (
+            output
+          )}
+        </h1>
+      ) : (
+        <h1>No words were entered.</h1>
+      )}
     </div>
   );
 }
@@ -347,17 +392,17 @@ function AdminFrame({
   onClose: () => void;
 }) {
   return (
-    <div className="admin-backdrop">
-      <section className="admin-panel">
+    <main className="admin-page">
+      <section className="admin-shell">
         <div className="admin-titlebar">
-          <Brand />
-          <button className="icon-button" aria-label="Close admin dashboard" onClick={onClose}>
-            x
+          <button className="back-button" aria-label="Back to game" onClick={onClose}>
+            <span aria-hidden="true">&larr;</span>
           </button>
+          <Brand />
         </div>
         {children}
       </section>
-    </div>
+    </main>
   );
 }
 
@@ -431,7 +476,9 @@ function DashboardContent({
         </div>
 
         {active && session ? <LiveAdminSummary session={session} state={state} /> : null}
-        {!active && session?.status === "ended" ? <OutputPanel output={session.endedOutput} /> : null}
+        {!active && session?.status === "ended" ? (
+          <OutputPanel output={session.endedOutput} segments={state?.outputSegments} />
+        ) : null}
         {!active && setup === "nextWord" ? <NextWordSetup token={token} /> : null}
         {!active && setup === "followMe" ? <FollowMeSetup token={token} /> : null}
         {!active && setup === "none" && session?.status !== "ended" ? (
@@ -515,6 +562,7 @@ function adminUserStatus(
 }
 
 function LiveAdminSummary({ session, state }: { session: AdminSession; state: AdminState | undefined }) {
+  const [progressVisible, setProgressVisible] = useState(false);
   const joined = state?.users.filter((user) => user.status === "joined") ?? [];
   const entries = state?.entries ?? [];
   const ready = entries.length;
@@ -525,17 +573,29 @@ function LiveAdminSummary({ session, state }: { session: AdminSession; state: Ad
 
   return (
     <div className="live-summary">
-      <p className="eyebrow">{session.mode === "nextWord" ? "Next Word" : "Follow me"}</p>
+      <div className="summary-header">
+        <p className="eyebrow">{session.mode === "nextWord" ? "Next Word" : "Follow me"}</p>
+        <button
+          className="icon-button"
+          type="button"
+          aria-label={progressVisible ? "Hide current progress" : "Show current progress"}
+          aria-pressed={progressVisible}
+          title={progressVisible ? "Hide current progress" : "Show current progress"}
+          onClick={() => setProgressVisible((visible) => !visible)}
+        >
+          <span aria-hidden="true">&#128065;</span>
+        </button>
+      </div>
       {session.mode === "nextWord" ? (
         <>
-          <h1>{session.currentWord}</h1>
+          <h1>{progressVisible ? session.currentWord : "Progress hidden"}</h1>
           <p>
             {ready}/{joined.length} ready
           </p>
         </>
       ) : (
         <>
-          <h1>{session.context || "No words yet."}</h1>
+          <h1>{progressVisible ? session.context || "No words yet." : "Progress hidden"}</h1>
           <p>Round {session.roundNumber}</p>
         </>
       )}
@@ -586,6 +646,7 @@ function FollowMeSetup({ token }: { token: string }) {
   const startFollowMe = useMutation(api.game.startFollowMe);
   const [shown, setShown] = useState(31);
   const [entered, setEntered] = useState(5);
+  const [initialContext, setInitialContext] = useState("");
   const [showToAll, setShowToAll] = useState(false);
   const [error, setError] = useState("");
   const shownValue = shown === 31 ? 0 : shown;
@@ -601,6 +662,7 @@ function FollowMeSetup({ token }: { token: string }) {
             adminToken: token,
             wordsShownPerRound: shownValue,
             wordsEnteredPerRound: entered,
+            initialContext,
             showToAll,
           });
         } catch (err) {
@@ -618,6 +680,15 @@ function FollowMeSetup({ token }: { token: string }) {
           onChange={(event) => setShown(Number(event.target.value))}
         />
         <span className="range-readout">{shown === 31 ? "all" : shown}</span>
+      </label>
+      <label>
+        Initial context
+        <textarea
+          value={initialContext}
+          onChange={(event) => setInitialContext(event.target.value)}
+          rows={4}
+          placeholder="Set the opening prompt or story so far."
+        />
       </label>
       <label>
         How many words entered per round
