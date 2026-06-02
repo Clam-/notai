@@ -1,8 +1,6 @@
 import { v } from "convex/values";
-import { mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
+import { env, mutation, query, type MutationCtx, type QueryCtx } from "./_generated/server";
 import type { Doc, Id } from "./_generated/dataModel";
-
-declare const process: { env: { ADMIN_PASSWORD?: string } };
 
 const SESSION_KEY = "main";
 const DEFAULT_KEEPALIVE_TIMEOUT_MS = 2 * 60 * 1000;
@@ -820,7 +818,7 @@ export const adminLogin = mutation({
     clientConfiguredPassword: v.union(v.string(), v.null()),
   },
   handler: async (ctx, args) => {
-    const configuredPassword = process.env.ADMIN_PASSWORD ?? args.clientConfiguredPassword;
+    const configuredPassword = env.ADMIN_PASSWORD ?? args.clientConfiguredPassword;
     if (!configuredPassword) {
       throw new Error("Admin password is not configured");
     }
