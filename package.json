@@ -1,0 +1,21 @@
+{
+	"scripts": {
+		"dev": "concurrently --names convex,vite \"pnpm convex:dev\" \"vite\"",
+		"build": "tsc -b && vite build",
+		"convex:dev": "convex dev",
+		"convex:codegen": "convex codegen"
+	},
+	"dependencies": {
+		"@vitejs/plugin-react": "^6.0.2",
+		"convex": "^1.39.1",
+		"react": "^19.2.6",
+		"react-dom": "^19.2.6",
+		"typescript": "^6.0.3",
+		"vite": "^8.0.14"
+	},
+	"devDependencies": {
+		"@types/react": "^19.2.15",
+		"@types/react-dom": "^19.2.3",
+		"concurrently": "^10.0.1"
+	}
+}

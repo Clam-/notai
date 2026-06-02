@@ -1,0 +1,488 @@
+import { v } from "convex/values";
+import { mutation, query, type MutationCtx } from "./_generated/server";
+import type { Doc } from "./_generated/dataModel";
+
+declare const process: { env: { ADMIN_PASSWORD?: string } };
+
+const SESSION_KEY = "main";
+
+type SessionDoc = Doc<"sessions">;
+
+async function getSession(ctx: MutationCtx): Promise<SessionDoc> {
+  const existing = await ctx.db
+    .query("sessions")
+    .withIndex("by_key", (q) => q.eq("key", SESSION_KEY))
+    .unique();
+
+  if (existing) {
+    return existing;
+  }
+
+  const id = await ctx.db.insert("sessions", {
+    key: SESSION_KEY,
+    status: "idle",
+    mode: "none",
+    roundNumber: 1,
+    currentWord: "",
+    context: "",
+    wordsPerRound: 1,
+    wordsShownPerRound: 0,
+    wordsEnteredPerRound: 5,
+    showToAll: false,
+    turnIndex: 0,
+    endedOutput: "",
+  });
+  const session = await ctx.db.get(id);
+  if (!session) {
+    throw new Error("Unable to create session");
+  }
+  return session;
+}
+
+async function requireAdmin(ctx: MutationCtx, token: string) {
+  const adminSession = await ctx.db
+    .query("adminSessions")
+    .withIndex("by_token", (q) => q.eq("token", token))
+    .unique();
+
+  if (!adminSession) {
+    throw new Error("Admin access required");
+  }
+}
+
+function cleanName(name: string) {
+  return name.trim().replace(/\s+/g, " ").slice(0, 60);
+}
+
+function splitWords(text: string) {
+  return text
+    .trim()
+    .split(/\s+/)
+    .map((word) => word.trim())
+    .filter(Boolean);
+}
+
+function appendContext(context: string, next: string) {
+  const cleaned = next.trim();
+  if (!cleaned) {
+    return context;
+  }
+  return context ? `${context} ${cleaned}` : cleaned;
+}
+
+async function listJoinedUsers(ctx: MutationCtx) {
+  const users = await ctx.db.query("users").collect();
+  return users
+    .filter((user) => user.status === "joined")
+    .sort((a, b) => {
+      const joinedA = a.joinedAt ?? a._creationTime;
+      const joinedB = b.joinedAt ?? b._creationTime;
+      return joinedA - joinedB;
+    });
+}
+
+async function advanceNextWordRound(ctx: MutationCtx, session: SessionDoc) {
+  const entries = await ctx.db
+    .query("entries")
+    .withIndex("by_roundNumber", (q) => q.eq("roundNumber", session.roundNumber))
+    .collect();
+  const currentEntries = entries.filter((entry) => entry.mode === "nextWord");
+
+  const counts = new Map<string, { word: string; count: number; firstSeen: number }>();
+  currentEntries.forEach((entry) => {
+    entry.words.forEach((word) => {
+      const trimmed = word.trim();
+      if (!trimmed) {
+        return;
+      }
+      const key = trimmed.toLocaleLowerCase();
+      const existing = counts.get(key);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        counts.set(key, { word: trimmed, count: 1, firstSeen: entry._creationTime });
+      }
+    });
+  });
+
+  const winner = [...counts.values()].sort((a, b) => {
+    if (b.count !== a.count) {
+      return b.count - a.count;
+    }
+    return a.firstSeen - b.firstSeen;
+  })[0];
+
+  const nextWord = winner?.word ?? session.currentWord;
+  await ctx.db.patch(session._id, {
+    currentWord: nextWord,
+    context: winner ? appendContext(session.context, nextWord) : session.context,
+    roundNumber: session.roundNumber + 1,
+  });
+}
+
+async function advanceFollowMeTurn(ctx: MutationCtx, session: SessionDoc) {
+  const joinedUsers = await listJoinedUsers(ctx);
+  if (joinedUsers.length === 0) {
+    return;
+  }
+  await ctx.db.patch(session._id, {
+    turnIndex: (session.turnIndex + 1) % joinedUsers.length,
+    roundNumber: session.roundNumber + 1,
+  });
+}
+
+export const getParticipantState = query({
+  args: { clientId: v.string() },
+  handler: async (ctx, args) => {
+    const user = await ctx.db
+      .query("users")
+      .withIndex("by_clientId", (q) => q.eq("clientId", args.clientId))
+      .unique();
+    const session = await ctx.db
+      .query("sessions")
+      .withIndex("by_key", (q) => q.eq("key", SESSION_KEY))
+      .unique();
+    const users = await ctx.db.query("users").collect();
+    const joinedUsers = users
+      .filter((item) => item.status === "joined")
+      .sort((a, b) => {
+        const joinedA = a.joinedAt ?? a._creationTime;
+        const joinedB = b.joinedAt ?? b._creationTime;
+        return joinedA - joinedB;
+      });
+
+    const ownEntry =
+      user && session
+        ? await ctx.db
+            .query("entries")
+            .withIndex("by_userId_and_roundNumber", (q) =>
+              q.eq("userId", user._id).eq("roundNumber", session.roundNumber),
+            )
+            .unique()
+        : null;
+
+    const turnUser =
+      session && joinedUsers.length > 0
+        ? joinedUsers[session.turnIndex % joinedUsers.length]
+        : null;
+    const ownIndex = user
+      ? joinedUsers.findIndex((joinedUser) => joinedUser._id === user._id)
+      : -1;
+    const peopleInFront =
+      session && ownIndex >= 0 && joinedUsers.length > 0
+        ? (ownIndex - session.turnIndex + joinedUsers.length) % joinedUsers.length
+        : null;
+
+    return {
+      user,
+      session,
+      ownEntry,
+      joinedCount: joinedUsers.length,
+      isCurrentTurn: Boolean(user && turnUser && turnUser._id === user._id),
+      peopleInFront,
+    };
+  },
+});
+
+export const getAdminState = query({
+  args: { adminToken: v.union(v.string(), v.null()) },
+  handler: async (ctx, args) => {
+    if (!args.adminToken) {
+      return { authorized: false, users: [], session: null, entries: [] };
+    }
+
+    const adminSession = await ctx.db
+      .query("adminSessions")
+      .withIndex("by_token", (q) => q.eq("token", args.adminToken ?? ""))
+      .unique();
+    if (!adminSession) {
+      return { authorized: false, users: [], session: null, entries: [] };
+    }
+
+    const users = await ctx.db.query("users").collect();
+    const session = await ctx.db
+      .query("sessions")
+      .withIndex("by_key", (q) => q.eq("key", SESSION_KEY))
+      .unique();
+    const entries = session
+      ? await ctx.db
+          .query("entries")
+          .withIndex("by_roundNumber", (q) => q.eq("roundNumber", session.roundNumber))
+          .collect()
+      : [];
+
+    return {
+      authorized: true,
+      users: users.sort((a, b) => {
+        const joinedA = a.joinedAt ?? a._creationTime;
+        const joinedB = b.joinedAt ?? b._creationTime;
+        return joinedA - joinedB;
+      }),
+      session,
+      entries,
+    };
+  },
+});
+
+export const join = mutation({
+  args: { clientId: v.string(), name: v.string() },
+  handler: async (ctx, args) => {
+    const name = cleanName(args.name);
+    if (!name) {
+      throw new Error("Name is required");
+    }
+
+    await getSession(ctx);
+    const existing = await ctx.db
+      .query("users")
+      .withIndex("by_clientId", (q) => q.eq("clientId", args.clientId))
+      .unique();
+
+    if (existing) {
+      await ctx.db.patch(existing._id, { name });
+      return existing._id;
+    }
+
+    return await ctx.db.insert("users", {
+      clientId: args.clientId,
+      name,
+      status: "waiting",
+      joinedAt: null,
+    });
+  },
+});
+
+export const adminLogin = mutation({
+  args: {
+    password: v.string(),
+    clientConfiguredPassword: v.union(v.string(), v.null()),
+  },
+  handler: async (ctx, args) => {
+    const configuredPassword = process.env.ADMIN_PASSWORD ?? args.clientConfiguredPassword;
+    if (!configuredPassword) {
+      throw new Error("Admin password is not configured");
+    }
+    if (args.password !== configuredPassword) {
+      throw new Error("Incorrect password");
+    }
+
+    const token = crypto.randomUUID();
+    await ctx.db.insert("adminSessions", { token, createdAt: Date.now() });
+    await getSession(ctx);
+    return token;
+  },
+});
+
+export const approveUser = mutation({
+  args: { adminToken: v.string(), userId: v.id("users") },
+  handler: async (ctx, args) => {
+    await requireAdmin(ctx, args.adminToken);
+    await ctx.db.patch(args.userId, { status: "joined", joinedAt: Date.now() });
+  },
+});
+
+export const startNextWord = mutation({
+  args: { adminToken: v.string(), wordsPerRound: v.number(), startingWord: v.string() },
+  handler: async (ctx, args) => {
+    await requireAdmin(ctx, args.adminToken);
+    const session = await getSession(ctx);
+    const startingWord = args.startingWord.trim();
+    if (!startingWord) {
+      throw new Error("Starting word is required");
+    }
+
+    await ctx.db.patch(session._id, {
+      status: "active",
+      mode: "nextWord",
+      roundNumber: 1,
+      currentWord: startingWord,
+      context: startingWord,
+      wordsPerRound: Math.max(1, Math.min(10, Math.floor(args.wordsPerRound))),
+      endedOutput: "",
+      turnIndex: 0,
+    });
+  },
+});
+
+export const startFollowMe = mutation({
+  args: {
+    adminToken: v.string(),
+    wordsShownPerRound: v.number(),
+    wordsEnteredPerRound: v.number(),
+    showToAll: v.boolean(),
+  },
+  handler: async (ctx, args) => {
+    await requireAdmin(ctx, args.adminToken);
+    const session = await getSession(ctx);
+
+    await ctx.db.patch(session._id, {
+      status: "active",
+      mode: "followMe",
+      roundNumber: 1,
+      currentWord: "",
+      context: "",
+      wordsShownPerRound: Math.max(0, Math.min(30, Math.floor(args.wordsShownPerRound))),
+      wordsEnteredPerRound: Math.max(1, Math.min(50, Math.floor(args.wordsEnteredPerRound))),
+      showToAll: args.showToAll,
+      turnIndex: 0,
+      endedOutput: "",
+    });
+  },
+});
+
+export const submitNextWord = mutation({
+  args: { clientId: v.string(), words: v.array(v.string()) },
+  handler: async (ctx, args) => {
+    const session = await getSession(ctx);
+    if (session.status !== "active" || session.mode !== "nextWord") {
+      throw new Error("Next Word is not active");
+    }
+
+    const user = await ctx.db
+      .query("users")
+      .withIndex("by_clientId", (q) => q.eq("clientId", args.clientId))
+      .unique();
+    if (!user || user.status !== "joined") {
+      throw new Error("You are not joined");
+    }
+
+    const cleanedWords = args.words
+      .map((word) => word.trim())
+      .filter(Boolean)
+      .slice(0, session.wordsPerRound);
+    if (cleanedWords.length === 0) {
+      throw new Error("Enter at least one word");
+    }
+
+    const existing = await ctx.db
+      .query("entries")
+      .withIndex("by_userId_and_roundNumber", (q) =>
+        q.eq("userId", user._id).eq("roundNumber", session.roundNumber),
+      )
+      .unique();
+    if (existing) {
+      await ctx.db.patch(existing._id, { words: cleanedWords, text: "" });
+    } else {
+      await ctx.db.insert("entries", {
+        roundNumber: session.roundNumber,
+        mode: "nextWord",
+        userId: user._id,
+        words: cleanedWords,
+        text: "",
+      });
+    }
+
+    const joinedUsers = await listJoinedUsers(ctx);
+    const roundEntries = await ctx.db
+      .query("entries")
+      .withIndex("by_roundNumber", (q) => q.eq("roundNumber", session.roundNumber))
+      .collect();
+    const submittedUserIds = new Set(
+      roundEntries.filter((entry) => entry.mode === "nextWord").map((entry) => entry.userId),
+    );
+
+    if (
+      joinedUsers.length > 0 &&
+      joinedUsers.every((joinedUser) => submittedUserIds.has(joinedUser._id))
+    ) {
+      await advanceNextWordRound(ctx, session);
+    }
+  },
+});
+
+export const submitFollowMe = mutation({
+  args: { clientId: v.string(), text: v.string() },
+  handler: async (ctx, args) => {
+    const session = await getSession(ctx);
+    if (session.status !== "active" || session.mode !== "followMe") {
+      throw new Error("Follow Me is not active");
+    }
+
+    const user = await ctx.db
+      .query("users")
+      .withIndex("by_clientId", (q) => q.eq("clientId", args.clientId))
+      .unique();
+    if (!user || user.status !== "joined") {
+      throw new Error("You are not joined");
+    }
+
+    const joinedUsers = await listJoinedUsers(ctx);
+    const currentUser = joinedUsers[session.turnIndex % joinedUsers.length];
+    if (!currentUser || currentUser._id !== user._id) {
+      throw new Error("It is not your turn");
+    }
+
+    const words = splitWords(args.text);
+    if (words.length === 0) {
+      throw new Error("Enter at least one word");
+    }
+    if (words.length > session.wordsEnteredPerRound) {
+      throw new Error("Too many words");
+    }
+
+    await ctx.db.insert("entries", {
+      roundNumber: session.roundNumber,
+      mode: "followMe",
+      userId: user._id,
+      words,
+      text: words.join(" "),
+    });
+    await ctx.db.patch(session._id, { context: appendContext(session.context, words.join(" ")) });
+
+    const latestSession = await ctx.db.get(session._id);
+    if (latestSession) {
+      await advanceFollowMeTurn(ctx, latestSession);
+    }
+  },
+});
+
+export const nextTurn = mutation({
+  args: { adminToken: v.string() },
+  handler: async (ctx, args) => {
+    await requireAdmin(ctx, args.adminToken);
+    const session = await getSession(ctx);
+    if (session.status !== "active") {
+      return;
+    }
+    if (session.mode === "nextWord") {
+      await advanceNextWordRound(ctx, session);
+    } else if (session.mode === "followMe") {
+      await advanceFollowMeTurn(ctx, session);
+    }
+  },
+});
+
+export const endGame = mutation({
+  args: { adminToken: v.string() },
+  handler: async (ctx, args) => {
+    await requireAdmin(ctx, args.adminToken);
+    const session = await getSession(ctx);
+    await ctx.db.patch(session._id, { status: "ended", endedOutput: session.context });
+  },
+});
+
+export const resetSession = mutation({
+  args: { adminToken: v.string() },
+  handler: async (ctx, args) => {
+    await requireAdmin(ctx, args.adminToken);
+
+    const users = await ctx.db.query("users").collect();
+    await Promise.all(users.map((user) => ctx.db.delete(user._id)));
+    const entries = await ctx.db.query("entries").collect();
+    await Promise.all(entries.map((entry) => ctx.db.delete(entry._id)));
+    const session = await getSession(ctx);
+    await ctx.db.patch(session._id, {
+      status: "idle",
+      mode: "none",
+      roundNumber: 1,
+      currentWord: "",
+      context: "",
+      wordsPerRound: 1,
+      wordsShownPerRound: 0,
+      wordsEnteredPerRound: 5,
+      showToAll: false,
+      turnIndex: 0,
+      endedOutput: "",
+    });
+  },
+});

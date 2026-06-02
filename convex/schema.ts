@@ -1,0 +1,47 @@
+import { defineSchema, defineTable } from "convex/server";
+import { v } from "convex/values";
+
+export default defineSchema({
+  users: defineTable({
+    clientId: v.string(),
+    name: v.string(),
+    status: v.union(
+      v.literal("waiting"),
+      v.literal("transitioning"),
+      v.literal("joined"),
+    ),
+    joinedAt: v.union(v.number(), v.null()),
+  })
+    .index("by_clientId", ["clientId"])
+    .index("by_status", ["status"]),
+
+  sessions: defineTable({
+    key: v.string(),
+    status: v.union(v.literal("idle"), v.literal("active"), v.literal("ended")),
+    mode: v.union(v.literal("none"), v.literal("nextWord"), v.literal("followMe")),
+    roundNumber: v.number(),
+    currentWord: v.string(),
+    context: v.string(),
+    wordsPerRound: v.number(),
+    wordsShownPerRound: v.number(),
+    wordsEnteredPerRound: v.number(),
+    showToAll: v.boolean(),
+    turnIndex: v.number(),
+    endedOutput: v.string(),
+  }).index("by_key", ["key"]),
+
+  entries: defineTable({
+    roundNumber: v.number(),
+    mode: v.union(v.literal("nextWord"), v.literal("followMe")),
+    userId: v.id("users"),
+    words: v.array(v.string()),
+    text: v.string(),
+  })
+    .index("by_roundNumber", ["roundNumber"])
+    .index("by_userId_and_roundNumber", ["userId", "roundNumber"]),
+
+  adminSessions: defineTable({
+    token: v.string(),
+    createdAt: v.number(),
+  }).index("by_token", ["token"]),
+});
