@@ -22,6 +22,8 @@ export default defineSchema({
     roundNumber: v.number(),
     currentWord: v.string(),
     context: v.string(),
+    seedKind: v.optional(v.union(v.literal("startingWord"), v.literal("topic"))),
+    seedText: v.optional(v.string()),
     wordsPerRound: v.number(),
     wordsShownPerRound: v.number(),
     wordsEnteredPerRound: v.number(),

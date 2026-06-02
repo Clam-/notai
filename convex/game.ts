@@ -18,6 +18,8 @@ type OutputSegment = {
   summary: string;
 };
 
+type SeedKind = "startingWord" | "topic";
+
 async function getSession(ctx: MutationCtx): Promise<SessionDoc> {
   const existing = await ctx.db
     .query("sessions")
@@ -35,6 +37,8 @@ async function getSession(ctx: MutationCtx): Promise<SessionDoc> {
     roundNumber: 1,
     currentWord: "",
     context: "",
+    seedKind: "startingWord",
+    seedText: "",
     wordsPerRound: 1,
     wordsShownPerRound: 0,
     wordsEnteredPerRound: 5,
@@ -80,8 +84,43 @@ function appendContext(context: string, next: string) {
   return context ? `${context} ${cleaned}` : cleaned;
 }
 
+function cleanSeedKind(kind: string): SeedKind {
+  return kind === "topic" ? "topic" : "startingWord";
+}
+
 function userName(userNameById: Map<Id<"users">, string>, userId: Id<"users">) {
   return userNameById.get(userId) ?? "Unknown participant";
+}
+
+async function entriesForUserRound(
+  ctx: QueryCtx | MutationCtx,
+  userId: Id<"users">,
+  roundNumber: number,
+  mode: EntryDoc["mode"],
+) {
+  const entries = await ctx.db
+    .query("entries")
+    .withIndex("by_userId_and_roundNumber", (q) =>
+      q.eq("userId", userId).eq("roundNumber", roundNumber),
+    )
+    .collect();
+
+  return entries
+    .filter((entry) => entry.mode === mode)
+    .sort((a, b) => b._creationTime - a._creationTime);
+}
+
+async function latestEntryForUserRound(
+  ctx: QueryCtx | MutationCtx,
+  userId: Id<"users">,
+  roundNumber: number,
+  mode: EntryDoc["mode"],
+) {
+  return (await entriesForUserRound(ctx, userId, roundNumber, mode))[0] ?? null;
+}
+
+async function deleteEntries(ctx: MutationCtx, entries: EntryDoc[]) {
+  await Promise.all(entries.map((entry) => ctx.db.delete(entry._id)));
 }
 
 function namesForWinningWord(
@@ -147,8 +186,10 @@ function includedNextWordWinners(output: string, entries: EntryDoc[]) {
     if (!appendedText) {
       continue;
     }
-    const prefixLength =
-      output === appendedText ? 0 : output.endsWith(` ${appendedText}`) ? output.length - appendedText.length : -1;
+    if (output === appendedText) {
+      return winners;
+    }
+    const prefixLength = output.endsWith(` ${appendedText}`) ? output.length - appendedText.length : -1;
     if (prefixLength > 0 && output.slice(0, prefixLength).trim()) {
       return winners;
     }
@@ -204,7 +245,9 @@ async function outputSegmentsForSession(
       appendedText && output.endsWith(appendedText)
         ? output.slice(0, output.length - appendedText.length).trim()
         : output;
-    const segments: OutputSegment[] = initialText
+    const segments: OutputSegment[] = session.seedKind === "topic"
+      ? []
+      : initialText
       ? [
           {
             text: initialText,
@@ -236,7 +279,9 @@ async function outputSegmentsForSession(
     const winners = includedNextWordWinners(output, recentEntries);
     const appendedText = winners.map((winner) => winner.word).join(" ");
     const startingText = appendedText ? output.slice(0, output.length - appendedText.length).trim() : output;
-    const segments: OutputSegment[] = startingText
+    const segments: OutputSegment[] = session.seedKind === "topic"
+      ? []
+      : startingText
       ? [
           {
             text: startingText,
@@ -351,13 +396,8 @@ export const getParticipantState = query({
       });
 
     const ownEntry =
-      user && session
-        ? await ctx.db
-            .query("entries")
-            .withIndex("by_userId_and_roundNumber", (q) =>
-              q.eq("userId", user._id).eq("roundNumber", session.roundNumber),
-            )
-            .unique()
+      user && session?.mode === "nextWord"
+        ? await latestEntryForUserRound(ctx, user._id, session.roundNumber, "nextWord")
         : null;
 
     const turnUser =
@@ -487,21 +527,30 @@ export const approveUser = mutation({
 });
 
 export const startNextWord = mutation({
-  args: { adminToken: v.string(), wordsPerRound: v.number(), startingWord: v.string() },
+  args: {
+    adminToken: v.string(),
+    wordsPerRound: v.number(),
+    startingWord: v.string(),
+    seedKind: v.string(),
+  },
   handler: async (ctx, args) => {
     await requireAdmin(ctx, args.adminToken);
     const session = await getSession(ctx);
     const startingWord = args.startingWord.trim();
+    const seedKind = cleanSeedKind(args.seedKind);
     if (!startingWord) {
-      throw new Error("Starting word is required");
+      throw new Error(seedKind === "topic" ? "Topic is required" : "Starting word is required");
     }
 
+    await deleteEntries(ctx, await ctx.db.query("entries").collect());
     await ctx.db.patch(session._id, {
       status: "active",
       mode: "nextWord",
       roundNumber: 1,
       currentWord: startingWord,
-      context: startingWord,
+      context: seedKind === "topic" ? "" : startingWord,
+      seedKind,
+      seedText: startingWord,
       wordsPerRound: Math.max(1, Math.min(10, Math.floor(args.wordsPerRound))),
       endedOutput: "",
       turnIndex: 0,
@@ -515,19 +564,24 @@ export const startFollowMe = mutation({
     wordsShownPerRound: v.number(),
     wordsEnteredPerRound: v.number(),
     initialContext: v.string(),
+    seedKind: v.string(),
     showToAll: v.boolean(),
   },
   handler: async (ctx, args) => {
     await requireAdmin(ctx, args.adminToken);
     const session = await getSession(ctx);
     const initialContext = args.initialContext.trim();
+    const seedKind = cleanSeedKind(args.seedKind);
 
+    await deleteEntries(ctx, await ctx.db.query("entries").collect());
     await ctx.db.patch(session._id, {
       status: "active",
       mode: "followMe",
       roundNumber: 1,
       currentWord: "",
-      context: initialContext,
+      context: seedKind === "topic" ? "" : initialContext,
+      seedKind,
+      seedText: initialContext,
       wordsShownPerRound: Math.max(0, Math.min(30, Math.floor(args.wordsShownPerRound))),
       wordsEnteredPerRound: Math.max(1, Math.min(50, Math.floor(args.wordsEnteredPerRound))),
       showToAll: args.showToAll,
@@ -557,24 +611,37 @@ export const submitNextWord = mutation({
       .map((word) => word.trim())
       .filter(Boolean)
       .slice(0, session.wordsPerRound);
-    if (cleanedWords.length === 0) {
+
+    const [existing, ...duplicateEntries] = await entriesForUserRound(
+      ctx,
+      user._id,
+      session.roundNumber,
+      "nextWord",
+    );
+    await deleteEntries(ctx, duplicateEntries);
+
+    const existingWords = existing?.words.map((word) => word.trim()).filter(Boolean) ?? [];
+    if (existingWords.length >= session.wordsPerRound) {
+      throw new Error("All words submitted");
+    }
+
+    const nextWords =
+      existingWords.length > 0 && cleanedWords.length === 1
+        ? [...existingWords, cleanedWords[0]]
+        : cleanedWords;
+    const limitedWords = nextWords.slice(0, session.wordsPerRound);
+    if (limitedWords.length === 0) {
       throw new Error("Enter at least one word");
     }
 
-    const existing = await ctx.db
-      .query("entries")
-      .withIndex("by_userId_and_roundNumber", (q) =>
-        q.eq("userId", user._id).eq("roundNumber", session.roundNumber),
-      )
-      .unique();
     if (existing) {
-      await ctx.db.patch(existing._id, { words: cleanedWords, text: "" });
+      await ctx.db.patch(existing._id, { words: limitedWords, text: "" });
     } else {
       await ctx.db.insert("entries", {
         roundNumber: session.roundNumber,
         mode: "nextWord",
         userId: user._id,
-        words: cleanedWords,
+        words: limitedWords,
         text: "",
       });
     }
@@ -585,7 +652,9 @@ export const submitNextWord = mutation({
       .withIndex("by_roundNumber", (q) => q.eq("roundNumber", session.roundNumber))
       .collect();
     const submittedUserIds = new Set(
-      roundEntries.filter((entry) => entry.mode === "nextWord").map((entry) => entry.userId),
+      roundEntries
+        .filter((entry) => entry.mode === "nextWord" && entry.words.length >= session.wordsPerRound)
+        .map((entry) => entry.userId),
     );
 
     if (
@@ -684,6 +753,8 @@ export const resetSession = mutation({
       roundNumber: 1,
       currentWord: "",
       context: "",
+      seedKind: "startingWord",
+      seedText: "",
       wordsPerRound: 1,
       wordsShownPerRound: 0,
       wordsEnteredPerRound: 5,

@@ -12,6 +12,7 @@ type AdminState = NonNullable<ReturnType<typeof useQuery<typeof api.game.getAdmi
 type AdminSession = AdminState["session"];
 type AdminEntry = AdminState["entries"][number];
 type OutputSegment = ParticipantState["outputSegments"][number] | AdminState["outputSegments"][number];
+type SeedKind = "startingWord" | "topic";
 
 function getClientId() {
   const existing = localStorage.getItem(CLIENT_ID_KEY);
@@ -50,6 +51,31 @@ function visibleContext(context: string, wordsShownPerRound: number) {
 
 function countWords(text: string) {
   return text.trim().split(/\s+/).filter(Boolean).length;
+}
+
+function seedKindForSession(session: { seedKind?: SeedKind } | null | undefined): SeedKind {
+  return session?.seedKind === "topic" ? "topic" : "startingWord";
+}
+
+function topicForSession(
+  session: { seedKind?: SeedKind; seedText?: string; currentWord?: string } | null | undefined,
+) {
+  if (seedKindForSession(session) !== "topic") {
+    return "";
+  }
+  return (session?.seedText || session?.currentWord || "").trim();
+}
+
+function nextWordPrompt(session: NonNullable<ParticipantState["session"]>) {
+  const isInitialTopic = seedKindForSession(session) === "topic" && session.roundNumber === 1;
+  return {
+    label: isInitialTopic ? "Topic" : "Current",
+    text: isInitialTopic ? topicForSession(session) : session.currentWord,
+  };
+}
+
+function oneLineInput(text: string) {
+  return text.replace(/[\r\n]+/g, " ");
 }
 
 export default function App() {
@@ -149,10 +175,11 @@ function ParticipantView({
 }) {
   const submitNextWord = useMutation(api.game.submitNextWord);
   const submitFollowMe = useMutation(api.game.submitFollowMe);
-  const [choices, setChoices] = useState<string[]>([""]);
+  const [nextWordChoice, setNextWordChoice] = useState("");
   const [followText, setFollowText] = useState("");
   const [error, setError] = useState("");
   const nextWordInputRef = useRef<HTMLInputElement | null>(null);
+  const followMeFormRef = useRef<HTMLFormElement | null>(null);
   const followMeTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const session = state?.session;
@@ -160,8 +187,8 @@ function ParticipantView({
   const wordsPerRound = session?.wordsPerRound ?? 1;
 
   useEffect(() => {
-    setChoices(Array.from({ length: wordsPerRound }, () => ""));
-  }, [session?.roundNumber, wordsPerRound]);
+    setNextWordChoice("");
+  }, [session?.roundNumber]);
 
   useEffect(() => {
     setFollowText("");
@@ -169,16 +196,34 @@ function ParticipantView({
   }, [session?.roundNumber]);
 
   useEffect(() => {
-    if (session?.mode === "nextWord" && !state?.ownEntry) {
-      nextWordInputRef.current?.focus();
+    const submittedCount = state?.ownEntry?.words.length ?? 0;
+    if (session?.mode === "nextWord" && submittedCount < wordsPerRound) {
+      const frame = requestAnimationFrame(() => {
+        nextWordInputRef.current?.focus();
+      });
+      return () => cancelAnimationFrame(frame);
     }
-  }, [session?.mode, session?.roundNumber, state?.ownEntry]);
+    return undefined;
+  }, [session?.mode, session?.roundNumber, state?.ownEntry?.words.length, wordsPerRound]);
 
   useEffect(() => {
     if (session?.mode === "followMe" && state?.isCurrentTurn) {
-      followMeTextareaRef.current?.focus();
+      const frame = requestAnimationFrame(() => {
+        followMeTextareaRef.current?.focus();
+      });
+      return () => cancelAnimationFrame(frame);
     }
+    return undefined;
   }, [session?.mode, session?.roundNumber, state?.isCurrentTurn]);
+
+  useEffect(() => {
+    const textarea = followMeTextareaRef.current;
+    if (!textarea || session?.mode !== "followMe" || !state?.isCurrentTurn) {
+      return;
+    }
+    textarea.style.height = "auto";
+    textarea.style.height = `${textarea.scrollHeight}px`;
+  }, [followText, session?.mode, state?.isCurrentTurn]);
 
   if (!state || !session) {
     return <StatusPanel title="Joining..." />;
@@ -193,11 +238,16 @@ function ParticipantView({
   }
 
   if (session.status === "ended") {
-    return <OutputPanel output={session.endedOutput} segments={state.outputSegments} />;
+    return <OutputPanel output={session.endedOutput} segments={state.outputSegments} topic={topicForSession(session)} />;
   }
 
   if (session.mode === "nextWord") {
-    if (state.ownEntry) {
+    const submittedWords = state.ownEntry?.words ?? [];
+    const submittedCount = submittedWords.length;
+    const complete = submittedCount >= wordsPerRound;
+    const prompt = nextWordPrompt(session);
+
+    if (complete) {
       return <StatusPanel title="Waiting for next turn..." />;
     }
 
@@ -207,32 +257,34 @@ function ParticipantView({
         onSubmit={async (event) => {
           event.preventDefault();
           setError("");
+          const cleaned = nextWordChoice.trim();
+          if (!cleaned) {
+            setError("Enter a word.");
+            return;
+          }
           try {
-            await submitNextWord({ clientId, words: choices });
-            setChoices(Array.from({ length: wordsPerRound }, () => ""));
+            await submitNextWord({ clientId, words: [cleaned] });
+            setNextWordChoice("");
           } catch (err) {
             setError(err instanceof Error ? err.message : "Could not submit.");
           }
         }}
       >
-        <p className="eyebrow">Current</p>
-        <h1>{session.currentWord}</h1>
-        <div className="choice-grid">
-          {choices.map((choice, index) => (
-            <label key={`${session.roundNumber}-${index}`}>
-              {choiceLabel(index, wordsPerRound)}
-              <input
-                ref={index === 0 ? nextWordInputRef : undefined}
-                value={choice}
-                onChange={(event) => {
-                  const next = [...choices];
-                  next[index] = event.target.value;
-                  setChoices(next);
-                }}
-              />
-            </label>
-          ))}
-        </div>
+        <p className="eyebrow">{prompt.label}</p>
+        <h1>{prompt.text}</h1>
+        <label>
+          {choiceLabel(submittedCount, wordsPerRound)}
+          <input
+            ref={nextWordInputRef}
+            value={nextWordChoice}
+            onChange={(event) => setNextWordChoice(event.target.value)}
+          />
+        </label>
+        {wordsPerRound > 1 ? (
+          <p className="meter">
+            {submittedCount}/{wordsPerRound} submitted
+          </p>
+        ) : null}
         {error ? <p className="error">{error}</p> : null}
         <button className="primary">Submit</button>
       </form>
@@ -251,12 +303,14 @@ function ParticipantView({
             ? "warn"
             : "ok";
     const shouldShowContext = session.showToAll || state.isCurrentTurn;
+    const topic = topicForSession(session);
     const context = visibleContext(session.context, session.wordsShownPerRound);
 
     if (!state.isCurrentTurn) {
       const peopleInFront = state.peopleInFront ?? 0;
       return (
         <div className="status-panel">
+          {session.showToAll && topic ? <ContextBlock label="Topic" context={topic} /> : null}
           {session.showToAll && context ? <ContextBlock context={context} /> : null}
           <h1>{peopleInFront === 1 ? "Get ready! You are next." : "Waiting for turn..."}</h1>
           {peopleInFront > 1 ? <p>{peopleInFront} people in front</p> : null}
@@ -266,6 +320,7 @@ function ParticipantView({
 
     return (
       <form
+        ref={followMeFormRef}
         className="game-panel"
         onSubmit={async (event) => {
           event.preventDefault();
@@ -278,15 +333,25 @@ function ParticipantView({
           }
         }}
       >
+        {shouldShowContext && topic ? <ContextBlock label="Topic" context={topic} /> : null}
         {shouldShowContext && context ? <ContextBlock context={context} /> : null}
         <label>
           Next words:
           <textarea
             ref={followMeTextareaRef}
-            className={`tone-${currentTone}`}
+            className={`auto-grow-textarea tone-${currentTone}`}
             value={followText}
-            onChange={(event) => setFollowText(event.target.value)}
-            rows={5}
+            onChange={(event) => setFollowText(oneLineInput(event.target.value))}
+            onKeyDown={(event) => {
+              if (event.key !== "Enter") {
+                return;
+              }
+              event.preventDefault();
+              if (!event.shiftKey && wordCount > 0 && wordCount <= limit) {
+                followMeFormRef.current?.requestSubmit();
+              }
+            }}
+            rows={1}
           />
         </label>
         <p className="meter">
@@ -311,12 +376,21 @@ function StatusPanel({ title }: { title: string }) {
   );
 }
 
-function OutputPanel({ output, segments = [] }: { output: string; segments?: OutputSegment[] }) {
+function OutputPanel({
+  output,
+  segments = [],
+  topic = "",
+}: {
+  output: string;
+  segments?: OutputSegment[];
+  topic?: string;
+}) {
   const visibleSegments = segments.filter((segment) => segment.text.trim());
 
   return (
     <div className="status-panel output">
       <p className="eyebrow">Final output</p>
+      {topic ? <ContextBlock label="Topic" context={topic} /> : null}
       {output ? (
         <h1 className="attributed-output">
           {visibleSegments.length > 0 ? (
@@ -346,10 +420,10 @@ function OutputPanel({ output, segments = [] }: { output: string; segments?: Out
   );
 }
 
-function ContextBlock({ context }: { context: string }) {
+function ContextBlock({ context, label = "Context" }: { context: string; label?: string }) {
   return (
     <div className="context-block">
-      <p className="eyebrow">Context</p>
+      <p className="eyebrow">{label}</p>
       <p>{context}</p>
     </div>
   );
@@ -477,7 +551,11 @@ function DashboardContent({
 
         {active && session ? <LiveAdminSummary session={session} state={state} /> : null}
         {!active && session?.status === "ended" ? (
-          <OutputPanel output={session.endedOutput} segments={state?.outputSegments} />
+          <OutputPanel
+            output={session.endedOutput}
+            segments={state?.outputSegments}
+            topic={topicForSession(session)}
+          />
         ) : null}
         {!active && setup === "nextWord" ? <NextWordSetup token={token} /> : null}
         {!active && setup === "followMe" ? <FollowMeSetup token={token} /> : null}
@@ -543,8 +621,12 @@ function adminUserStatus(
   }
 
   if (session.mode === "nextWord") {
-    const ready = entries.some((entry) => entry.userId === userId);
-    return ready ? "Ready to proceed" : "1 entry needed";
+    const entry = entries.find((item) => item.userId === userId && item.mode === "nextWord");
+    const submitted = Math.min(entry?.words.length ?? 0, session.wordsPerRound);
+    const remaining = session.wordsPerRound - submitted;
+    return remaining === 0
+      ? "Ready to proceed"
+      : `${remaining} ${remaining === 1 ? "entry" : "entries"} needed`;
   }
 
   if (joinedCount === 0) {
@@ -565,11 +647,15 @@ function LiveAdminSummary({ session, state }: { session: AdminSession; state: Ad
   const [progressVisible, setProgressVisible] = useState(false);
   const joined = state?.users.filter((user) => user.status === "joined") ?? [];
   const entries = state?.entries ?? [];
-  const ready = entries.length;
 
   if (!session) {
     return null;
   }
+
+  const ready =
+    session.mode === "nextWord"
+      ? entries.filter((entry) => entry.mode === "nextWord" && entry.words.length >= session.wordsPerRound).length
+      : entries.length;
 
   return (
     <div className="live-summary">
@@ -588,7 +674,7 @@ function LiveAdminSummary({ session, state }: { session: AdminSession; state: Ad
       </div>
       {session.mode === "nextWord" ? (
         <>
-          <h1>{progressVisible ? session.currentWord : "Progress hidden"}</h1>
+          <h1>{progressVisible ? nextWordPrompt(session).text : "Progress hidden"}</h1>
           <p>
             {ready}/{joined.length} ready
           </p>
@@ -607,6 +693,7 @@ function NextWordSetup({ token }: { token: string }) {
   const startNextWord = useMutation(api.game.startNextWord);
   const [wordsPerRound, setWordsPerRound] = useState(1);
   const [startingWord, setStartingWord] = useState("");
+  const [seedKind, setSeedKind] = useState<SeedKind>("startingWord");
   const [error, setError] = useState("");
 
   return (
@@ -616,12 +703,13 @@ function NextWordSetup({ token }: { token: string }) {
         event.preventDefault();
         setError("");
         try {
-          await startNextWord({ adminToken: token, wordsPerRound, startingWord });
+          await startNextWord({ adminToken: token, wordsPerRound, startingWord, seedKind });
         } catch (err) {
           setError(err instanceof Error ? err.message : "Could not start game.");
         }
       }}
     >
+      <SeedKindToggle value={seedKind} onChange={setSeedKind} />
       <label>
         How many words per round
         <input
@@ -633,7 +721,7 @@ function NextWordSetup({ token }: { token: string }) {
         />
       </label>
       <label>
-        Starting word
+        {seedKind === "topic" ? "Topic" : "Starting word"}
         <input value={startingWord} onChange={(event) => setStartingWord(event.target.value)} />
       </label>
       {error ? <p className="error">{error}</p> : null}
@@ -647,6 +735,7 @@ function FollowMeSetup({ token }: { token: string }) {
   const [shown, setShown] = useState(31);
   const [entered, setEntered] = useState(5);
   const [initialContext, setInitialContext] = useState("");
+  const [seedKind, setSeedKind] = useState<SeedKind>("startingWord");
   const [showToAll, setShowToAll] = useState(false);
   const [error, setError] = useState("");
   const shownValue = shown === 31 ? 0 : shown;
@@ -663,6 +752,7 @@ function FollowMeSetup({ token }: { token: string }) {
             wordsShownPerRound: shownValue,
             wordsEnteredPerRound: entered,
             initialContext,
+            seedKind,
             showToAll,
           });
         } catch (err) {
@@ -670,6 +760,7 @@ function FollowMeSetup({ token }: { token: string }) {
         }
       }}
     >
+      <SeedKindToggle value={seedKind} onChange={setSeedKind} />
       <label>
         How many words shown per round
         <input
@@ -682,7 +773,7 @@ function FollowMeSetup({ token }: { token: string }) {
         <span className="range-readout">{shown === 31 ? "all" : shown}</span>
       </label>
       <label>
-        Initial context
+        {seedKind === "topic" ? "Topic" : "Starting word"}
         <textarea
           value={initialContext}
           onChange={(event) => setInitialContext(event.target.value)}
@@ -711,5 +802,38 @@ function FollowMeSetup({ token }: { token: string }) {
       {error ? <p className="error">{error}</p> : null}
       <button className="primary">Start</button>
     </form>
+  );
+}
+
+function SeedKindToggle({
+  value,
+  onChange,
+}: {
+  value: SeedKind;
+  onChange: (value: SeedKind) => void;
+}) {
+  return (
+    <div className="segmented-control" role="radiogroup" aria-label="Starting text type">
+      <label className={value === "startingWord" ? "selected" : ""}>
+        <input
+          type="radio"
+          name="seed-kind"
+          value="startingWord"
+          checked={value === "startingWord"}
+          onChange={() => onChange("startingWord")}
+        />
+        Starting word
+      </label>
+      <label className={value === "topic" ? "selected" : ""}>
+        <input
+          type="radio"
+          name="seed-kind"
+          value="topic"
+          checked={value === "topic"}
+          onChange={() => onChange("topic")}
+        />
+        Topic
+      </label>
+    </div>
   );
 }

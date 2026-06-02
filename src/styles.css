@@ -191,11 +191,6 @@ label {
   text-transform: uppercase;
 }
 
-.choice-grid {
-  display: grid;
-  gap: 14px;
-}
-
 .context-block {
   display: grid;
   gap: 8px;
@@ -209,6 +204,14 @@ label {
   margin: -6px 0 0;
   color: #526174;
   font-weight: 800;
+}
+
+.auto-grow-textarea {
+  min-height: 48px;
+  max-height: 220px;
+  overflow: hidden;
+  resize: none;
+  line-height: 1.4;
 }
 
 .tone-empty {
@@ -377,6 +380,43 @@ label {
 .toggle-row input {
   width: 20px;
   height: 20px;
+}
+
+.segmented-control {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  overflow: hidden;
+  border: 1px solid #a7b1bf;
+  border-radius: 7px;
+  background: #ffffff;
+}
+
+.segmented-control label {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 42px;
+  padding: 0 12px;
+  color: #405065;
+  cursor: pointer;
+}
+
+.segmented-control label + label {
+  border-left: 1px solid #d7dde5;
+}
+
+.segmented-control label.selected {
+  background: #eef8f6;
+  color: #156c64;
+}
+
+.segmented-control input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .output h1 {
