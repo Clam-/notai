@@ -8,6 +8,27 @@ const KEEPALIVES_PER_TIMEOUT = 5;
 const MIN_KEEPALIVE_TIMEOUT_MS = 15 * 1000;
 const MAX_KEEPALIVE_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_WAKE_LOCK_MESSAGE_LENGTH = 160;
+const FUNCTION_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "as",
+  "at",
+  "but",
+  "by",
+  "for",
+  "from",
+  "in",
+  "nor",
+  "of",
+  "on",
+  "or",
+  "so",
+  "the",
+  "to",
+  "with",
+  "yet",
+]);
 
 type SessionDoc = Doc<"sessions">;
 type EntryDoc = Doc<"entries">;
@@ -56,6 +77,8 @@ async function getSession(ctx: MutationCtx): Promise<SessionDoc> {
     wordsShownPerRound: 0,
     wordsEnteredPerRound: 5,
     showToAll: false,
+    topicHideAfterTurns: 0,
+    topicFirstOnly: false,
     turnIndex: 0,
     endedOutput: "",
     keepaliveTimeoutMs: DEFAULT_KEEPALIVE_TIMEOUT_MS,
@@ -90,6 +113,40 @@ function splitWords(text: string) {
     .filter(Boolean);
 }
 
+function cleanSubmittedText(text: string) {
+  return text.trim().replace(/\s+/g, " ");
+}
+
+function calculationToken(word: string) {
+  return word
+    .trim()
+    .replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, "")
+    .toLocaleLowerCase();
+}
+
+function calculationWords(text: string) {
+  return splitWords(text)
+    .map(calculationToken)
+    .filter((word) => word && !FUNCTION_WORDS.has(word));
+}
+
+function calculationWordCount(text: string) {
+  return calculationWords(text).length;
+}
+
+function nextWordCalculationKey(text: string) {
+  return calculationWords(text)[0] ?? "";
+}
+
+function nextWordDisplayText(text: string) {
+  const words = splitWords(cleanSubmittedText(text));
+  const countedWordIndex = words.findIndex((word) => {
+    const token = calculationToken(word);
+    return Boolean(token && !FUNCTION_WORDS.has(token));
+  });
+  return countedWordIndex >= 0 ? words.slice(0, countedWordIndex + 1).join(" ") : "";
+}
+
 function appendContext(context: string, next: string) {
   const cleaned = next.trim();
   if (!cleaned) {
@@ -100,6 +157,13 @@ function appendContext(context: string, next: string) {
 
 function cleanSeedKind(kind: string): SeedKind {
   return kind === "topic" ? "topic" : "startingWord";
+}
+
+function clampTopicHideAfterTurns(turns: number) {
+  if (!Number.isFinite(turns)) {
+    return 0;
+  }
+  return Math.max(0, Math.min(20, Math.floor(turns)));
 }
 
 function sessionKeepaliveTimeoutMs(session: Pick<SessionDoc, "keepaliveTimeoutMs"> | null | undefined) {
@@ -236,9 +300,9 @@ function namesForWinningWord(
   winningWord: string,
   userNameById: Map<Id<"users">, string>,
 ) {
-  const key = winningWord.toLocaleLowerCase();
+  const key = nextWordCalculationKey(winningWord);
   const names = entries
-    .filter((entry) => entry.words.some((word) => word.trim().toLocaleLowerCase() === key))
+    .filter((entry) => entry.words.some((word) => nextWordCalculationKey(word) === key))
     .map((entry) => userName(userNameById, entry.userId));
   return [...new Set(names)];
 }
@@ -250,27 +314,32 @@ function nextWordChoicesForRound(
 ) {
   const submissions = entries.flatMap((entry) =>
     entry.words
-      .map((word) => word.trim())
+      .map(nextWordDisplayText)
       .filter(Boolean)
       .map((word) => ({
         userName: userName(userNameById, entry.userId),
         word,
+        key: nextWordCalculationKey(word),
       })),
   );
-  const total = submissions.length;
+  const total = submissions.filter((submission) => submission.key).length;
   const counts = submissions.reduce((nextCounts, submission) => {
-    const key = submission.word.toLocaleLowerCase();
+    const key = submission.key;
+    if (!key) {
+      return nextCounts;
+    }
     nextCounts.set(key, (nextCounts.get(key) ?? 0) + 1);
     return nextCounts;
   }, new Map<string, number>());
-  const winningKey = winningWord.toLocaleLowerCase();
+  const winningKey = nextWordCalculationKey(winningWord);
 
   return submissions
     .map((submission) => {
-      const key = submission.word.toLocaleLowerCase();
+      const key = submission.key;
       const count = counts.get(key) ?? 0;
       return {
-        ...submission,
+        userName: submission.userName,
+        word: submission.word,
         count,
         total,
         percent: total > 0 ? Math.round((count / total) * 100) : 0,
@@ -289,23 +358,26 @@ function nextWordChoicesForRound(
 }
 
 function wordCountForEntry(entry: EntryDoc) {
-  return (entry.text || entry.words.join(" ")).trim().split(/\s+/).filter(Boolean).length;
+  return calculationWordCount(entry.text || entry.words.join(" "));
 }
 
 function winningEntryForRound(entries: EntryDoc[]) {
   const counts = new Map<string, { word: string; count: number; firstSeen: number }>();
   entries.forEach((entry) => {
-    entry.words.forEach((word) => {
-      const trimmed = word.trim();
-      if (!trimmed) {
+    entry.words.forEach((word, index) => {
+      const displayText = nextWordDisplayText(word);
+      if (!displayText) {
         return;
       }
-      const key = trimmed.toLocaleLowerCase();
+      const key = nextWordCalculationKey(displayText);
+      if (!key) {
+        return;
+      }
       const existing = counts.get(key);
       if (existing) {
         existing.count += 1;
       } else {
-        counts.set(key, { word: trimmed, count: 1, firstSeen: entry._creationTime });
+        counts.set(key, { word: displayText, count: 1, firstSeen: entry._creationTime + index / 1000 });
       }
     });
   });
@@ -523,17 +595,20 @@ async function advanceNextWordRound(ctx: MutationCtx, session: SessionDoc) {
 
   const counts = new Map<string, { word: string; count: number; firstSeen: number }>();
   currentEntries.forEach((entry) => {
-    entry.words.forEach((word) => {
-      const trimmed = word.trim();
-      if (!trimmed) {
+    entry.words.forEach((word, index) => {
+      const displayText = nextWordDisplayText(word);
+      if (!displayText) {
         return;
       }
-      const key = trimmed.toLocaleLowerCase();
+      const key = nextWordCalculationKey(displayText);
+      if (!key) {
+        return;
+      }
       const existing = counts.get(key);
       if (existing) {
         existing.count += 1;
       } else {
-        counts.set(key, { word: trimmed, count: 1, firstSeen: entry._creationTime });
+        counts.set(key, { word: displayText, count: 1, firstSeen: entry._creationTime + index / 1000 });
       }
     });
   });
@@ -986,6 +1061,7 @@ export const startNextWord = mutation({
     wordsPerRound: v.number(),
     startingWord: v.string(),
     seedKind: v.string(),
+    topicHideAfterTurns: v.number(),
   },
   handler: async (ctx, args) => {
     await requireAdmin(ctx, args.adminToken);
@@ -1003,6 +1079,8 @@ export const startNextWord = mutation({
       seedKind,
       seedText: startingWord,
       wordsPerRound: Math.max(1, Math.min(10, Math.floor(args.wordsPerRound))),
+      topicHideAfterTurns: seedKind === "topic" ? clampTopicHideAfterTurns(args.topicHideAfterTurns) : 0,
+      topicFirstOnly: false,
       endedOutput: "",
       turnIndex: 0,
     });
@@ -1017,6 +1095,8 @@ export const startFollowMe = mutation({
     initialContext: v.string(),
     seedKind: v.string(),
     showToAll: v.boolean(),
+    topicHideAfterTurns: v.number(),
+    topicFirstOnly: v.boolean(),
   },
   handler: async (ctx, args) => {
     await requireAdmin(ctx, args.adminToken);
@@ -1036,6 +1116,8 @@ export const startFollowMe = mutation({
       wordsShownPerRound: Math.max(0, Math.min(30, Math.floor(args.wordsShownPerRound))),
       wordsEnteredPerRound: Math.max(1, Math.min(50, Math.floor(args.wordsEnteredPerRound))),
       showToAll: args.showToAll,
+      topicHideAfterTurns: seedKind === "topic" ? clampTopicHideAfterTurns(args.topicHideAfterTurns) : 0,
+      topicFirstOnly: seedKind === "topic" ? args.topicFirstOnly : false,
       turnIndex: 0,
       endedOutput: "",
     });
@@ -1061,7 +1143,7 @@ export const submitNextWord = mutation({
 
     const submittedWords = args.words.length > 0 ? args.words : [""];
     const cleanedWords = submittedWords
-      .map((word) => word.trim())
+      .map(nextWordDisplayText)
       .slice(0, session.wordsPerRound);
 
     const [existing, ...duplicateEntries] = await entriesForUserRound(
@@ -1124,11 +1206,13 @@ export const submitFollowMe = mutation({
       throw new Error("It is not your turn");
     }
 
-    const words = splitWords(args.text);
-    if (words.length === 0) {
+    const text = cleanSubmittedText(args.text);
+    const words = splitWords(text);
+    const countedWords = calculationWordCount(text);
+    if (countedWords === 0) {
       throw new Error("Enter at least one word");
     }
-    if (words.length > currentSession.wordsEnteredPerRound) {
+    if (countedWords > currentSession.wordsEnteredPerRound) {
       throw new Error("Too many words");
     }
 
@@ -1137,10 +1221,10 @@ export const submitFollowMe = mutation({
       mode: "followMe",
       userId: user._id,
       words,
-      text: words.join(" "),
+      text,
     });
     await ctx.db.patch(currentSession._id, {
-      context: appendContext(currentSession.context, words.join(" ")),
+      context: appendContext(currentSession.context, text),
     });
 
     const latestSession = await ctx.db.get(currentSession._id);
@@ -1199,6 +1283,8 @@ export const resetSession = mutation({
       wordsShownPerRound: 0,
       wordsEnteredPerRound: 5,
       showToAll: false,
+      topicHideAfterTurns: 0,
+      topicFirstOnly: false,
       turnIndex: 0,
       endedOutput: "",
       keepaliveTimeoutMs: DEFAULT_KEEPALIVE_TIMEOUT_MS,

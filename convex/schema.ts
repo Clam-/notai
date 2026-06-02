@@ -28,6 +28,8 @@ export default defineSchema({
     wordsShownPerRound: v.number(),
     wordsEnteredPerRound: v.number(),
     showToAll: v.boolean(),
+    topicHideAfterTurns: v.optional(v.number()),
+    topicFirstOnly: v.optional(v.boolean()),
     turnIndex: v.number(),
     endedOutput: v.string(),
     keepaliveTimeoutMs: v.optional(v.number()),

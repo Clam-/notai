@@ -94,8 +94,8 @@ label {
 
 .strike {
   text-decoration: line-through;
-  text-decoration-thickness: 0.11em;
-  text-decoration-color: #d04f3a;
+  text-decoration-thickness: 0.08em;
+  text-decoration-color: rgba(208, 79, 58, 0.62);
 }
 
 .pretend {
@@ -489,6 +489,11 @@ label {
 .toggle-row input {
   width: 20px;
   height: 20px;
+}
+
+.topic-options {
+  display: grid;
+  gap: 14px;
 }
 
 .segmented-control {

@@ -7,6 +7,27 @@ const CLIENT_ID_KEY = "notai.clientId";
 const NAME_KEY = "notai.name";
 const ADMIN_TOKEN_KEY = "notai.adminToken";
 const DEFAULT_KEEPALIVE_INTERVAL_MS = 24 * 1000;
+const FUNCTION_WORDS = new Set([
+  "a",
+  "an",
+  "and",
+  "as",
+  "at",
+  "but",
+  "by",
+  "for",
+  "from",
+  "in",
+  "nor",
+  "of",
+  "on",
+  "or",
+  "so",
+  "the",
+  "to",
+  "with",
+  "yet",
+]);
 
 type ParticipantState = NonNullable<ReturnType<typeof useQuery<typeof api.game.getParticipantState>>>;
 type AdminState = NonNullable<ReturnType<typeof useQuery<typeof api.game.getAdminState>>>;
@@ -71,7 +92,16 @@ function visibleContext(context: string, wordsShownPerRound: number) {
 }
 
 function countWords(text: string) {
-  return text.trim().split(/\s+/).filter(Boolean).length;
+  return text
+    .trim()
+    .split(/\s+/)
+    .map((word) =>
+      word
+        .trim()
+        .replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, "")
+        .toLocaleLowerCase(),
+    )
+    .filter((word) => word && !FUNCTION_WORDS.has(word)).length;
 }
 
 function sentenceParts(text: string) {
@@ -139,6 +169,40 @@ function topicForSession(
     return "";
   }
   return (session?.seedText || session?.currentWord || "").trim();
+}
+
+function shouldShowTopicDuringFollowMe(
+  session: NonNullable<ParticipantState["session"]>,
+  isCurrentTurn: boolean,
+) {
+  const hideAfterTurns = session.topicHideAfterTurns ?? 0;
+  if (hideAfterTurns > 0 && session.roundNumber > hideAfterTurns) {
+    return false;
+  }
+  if (session.topicFirstOnly) {
+    return session.roundNumber === 1 && isCurrentTurn;
+  }
+  return session.showToAll || isCurrentTurn;
+}
+
+function participantTopicForSession(
+  session: NonNullable<ParticipantState["session"]>,
+  state: ParticipantState,
+) {
+  const topic = topicForSession(session);
+  if (!topic) {
+    return topic;
+  }
+  if ((session.topicHideAfterTurns ?? 0) > 0 && session.roundNumber > (session.topicHideAfterTurns ?? 0)) {
+    return "";
+  }
+  if (session.mode !== "followMe") {
+    return topic;
+  }
+  if (session.status !== "active") {
+    return session.topicFirstOnly ? "" : topic;
+  }
+  return shouldShowTopicDuringFollowMe(session, state.isCurrentTurn) ? topic : "";
 }
 
 function nextWordPrompt(session: NonNullable<ParticipantState["session"]>) {
@@ -468,7 +532,13 @@ function ParticipantView({
   }
 
   if (session.status === "ended") {
-    return <OutputPanel output={session.endedOutput} segments={state.outputSegments} topic={topicForSession(session)} />;
+    return (
+      <OutputPanel
+        output={session.endedOutput}
+        segments={state.outputSegments}
+        topic={participantTopicForSession(session, state)}
+      />
+    );
   }
 
   if (session.mode === "nextWord") {
@@ -528,15 +598,16 @@ function ParticipantView({
           : wordCount >= limit * 0.75
             ? "warn"
             : "ok";
-    const shouldShowContext = session.showToAll || state.isCurrentTurn;
     const topic = topicForSession(session);
+    const shouldShowTopic = Boolean(topic) && shouldShowTopicDuringFollowMe(session, state.isCurrentTurn);
+    const shouldShowContext = session.showToAll || state.isCurrentTurn;
     const context = visibleContext(session.context, session.wordsShownPerRound);
 
     if (!state.isCurrentTurn) {
       const peopleInFront = state.peopleInFront ?? 0;
       return (
         <div className="status-panel">
-          {session.showToAll && topic ? <ContextBlock label="Topic" context={topic} /> : null}
+          {shouldShowTopic ? <ContextBlock label="Topic" context={topic} /> : null}
           {session.showToAll && context ? <ContextBlock context={context} /> : null}
           <h1>{peopleInFront === 1 ? "Get ready! You are next." : "Waiting for turn..."}</h1>
           {peopleInFront > 1 ? <p>{peopleInFront} people in front</p> : null}
@@ -559,7 +630,7 @@ function ParticipantView({
           }
         }}
       >
-        {shouldShowContext && topic ? <ContextBlock label="Topic" context={topic} /> : null}
+        {shouldShowTopic ? <ContextBlock label="Topic" context={topic} /> : null}
         {shouldShowContext && context ? <ContextBlock context={context} /> : null}
         <label>
           Next words:
@@ -1309,6 +1380,7 @@ function NextWordSetup({ token }: { token: string }) {
   const [wordsPerRound, setWordsPerRound] = useState(1);
   const [startingWord, setStartingWord] = useState("");
   const [seedKind, setSeedKind] = useState<SeedKind>("startingWord");
+  const [topicHideAfterTurns, setTopicHideAfterTurns] = useState(0);
   const [error, setError] = useState("");
 
   return (
@@ -1318,7 +1390,13 @@ function NextWordSetup({ token }: { token: string }) {
         event.preventDefault();
         setError("");
         try {
-          await startNextWord({ adminToken: token, wordsPerRound, startingWord, seedKind });
+          await startNextWord({
+            adminToken: token,
+            wordsPerRound,
+            startingWord,
+            seedKind,
+            topicHideAfterTurns,
+          });
         } catch (err) {
           setError(err instanceof Error ? err.message : "Could not start game.");
         }
@@ -1339,6 +1417,12 @@ function NextWordSetup({ token }: { token: string }) {
         {seedKind === "topic" ? "Topic" : "Starting word"}
         <input value={startingWord} onChange={(event) => setStartingWord(event.target.value)} />
       </label>
+      {seedKind === "topic" ? (
+        <TopicHideAfterTurnsControl
+          value={topicHideAfterTurns}
+          onChange={setTopicHideAfterTurns}
+        />
+      ) : null}
       {error ? <p className="error">{error}</p> : null}
       <button className="primary">Start</button>
     </form>
@@ -1352,6 +1436,8 @@ function FollowMeSetup({ token }: { token: string }) {
   const [initialContext, setInitialContext] = useState("");
   const [seedKind, setSeedKind] = useState<SeedKind>("startingWord");
   const [showToAll, setShowToAll] = useState(false);
+  const [topicHideAfterTurns, setTopicHideAfterTurns] = useState(0);
+  const [topicFirstOnly, setTopicFirstOnly] = useState(false);
   const [error, setError] = useState("");
   const shownValue = shown === 31 ? 0 : shown;
 
@@ -1369,6 +1455,8 @@ function FollowMeSetup({ token }: { token: string }) {
             initialContext,
             seedKind,
             showToAll,
+            topicHideAfterTurns,
+            topicFirstOnly,
           });
         } catch (err) {
           setError(err instanceof Error ? err.message : "Could not start game.");
@@ -1414,9 +1502,49 @@ function FollowMeSetup({ token }: { token: string }) {
         />
         Show to all
       </label>
+      {seedKind === "topic" ? (
+        <div className="topic-options">
+          <TopicHideAfterTurnsControl
+            value={topicHideAfterTurns}
+            onChange={setTopicHideAfterTurns}
+          />
+          <label className="toggle-row">
+            <input
+              type="checkbox"
+              checked={topicFirstOnly}
+              onChange={(event) => setTopicFirstOnly(event.target.checked)}
+            />
+            Show topic to first person only
+          </label>
+        </div>
+      ) : null}
       {error ? <p className="error">{error}</p> : null}
       <button className="primary">Start</button>
     </form>
+  );
+}
+
+function TopicHideAfterTurnsControl({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (value: number) => void;
+}) {
+  return (
+    <label>
+      Hide topic after
+      <input
+        type="range"
+        min={0}
+        max={20}
+        value={value}
+        onChange={(event) => onChange(Number(event.target.value))}
+      />
+      <span className="range-readout">
+        {value === 0 ? "show always" : `${value} ${value === 1 ? "turn" : "turns"}`}
+      </span>
+    </label>
   );
 }
 
