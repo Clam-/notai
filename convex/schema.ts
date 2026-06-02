@@ -52,6 +52,18 @@ export default defineSchema({
     userId: v.id("users"),
     clientId: v.string(),
     lastSeen: v.number(),
+    wakeLockStatus: v.optional(
+      v.union(
+        v.literal("unknown"),
+        v.literal("active"),
+        v.literal("unsupported"),
+        v.literal("failed"),
+        v.literal("released"),
+        v.literal("inactive"),
+      ),
+    ),
+    wakeLockMessage: v.optional(v.union(v.string(), v.null())),
+    wakeLockUpdatedAt: v.optional(v.number()),
   })
     .index("by_userId", ["userId"])
     .index("by_clientId", ["clientId"]),

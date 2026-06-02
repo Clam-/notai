@@ -340,6 +340,10 @@ label {
   font-weight: 800;
 }
 
+.user-row .wake-lock-warning {
+  color: #b3261e;
+}
+
 .user-name {
   display: inline-flex;
   min-width: 0;

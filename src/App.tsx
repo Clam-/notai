@@ -203,7 +203,16 @@ function useKeepalive(clientId: string, enabled: boolean, intervalMs: number) {
   }, [clientId, enabled, heartbeat, intervalMs]);
 }
 
-function useScreenWakeLock(enabled: boolean) {
+function wakeLockErrorMessage(err: unknown) {
+  if (err instanceof Error) {
+    return `${err.name}: ${err.message}`;
+  }
+  return "Wake lock request failed";
+}
+
+function useScreenWakeLock(clientId: string, enabled: boolean) {
+  const reportWakeLock = useMutation(api.game.reportWakeLock);
+
   useEffect(() => {
     if (!enabled) {
       return;
@@ -211,33 +220,70 @@ function useScreenWakeLock(enabled: boolean) {
 
     let cancelled = false;
     let sentinel: WakeLockSentinel | null = null;
+    let retryTimer: number | undefined;
+    const report = (
+      status: "active" | "unsupported" | "failed" | "released" | "inactive",
+      message: string | null,
+    ) => {
+      void reportWakeLock({ clientId, status, message });
+    };
+    const scheduleRetry = () => {
+      window.clearTimeout(retryTimer);
+      retryTimer = window.setTimeout(() => {
+        if (!cancelled && document.visibilityState === "visible" && document.hasFocus()) {
+          void requestWakeLock();
+        }
+      }, 1000);
+    };
     const requestWakeLock = async () => {
       const wakeLock = (navigator as NavigatorWithWakeLock).wakeLock;
-      if (!wakeLock || document.visibilityState !== "visible") {
+      if (!wakeLock) {
+        report("unsupported", "Screen Wake Lock API is not available");
+        return;
+      }
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      if (sentinel && !sentinel.released) {
         return;
       }
       try {
         sentinel = await wakeLock.request("screen");
-      } catch {
+        report("active", null);
+        sentinel.addEventListener("release", () => {
+          sentinel = null;
+          if (!cancelled) {
+            report("released", "Screen wake lock was released by the browser or system");
+            scheduleRetry();
+          }
+        });
+      } catch (err) {
         sentinel = null;
+        report("failed", wakeLockErrorMessage(err));
       }
     };
-    const handleVisibilityChange = () => {
-      if (document.visibilityState === "visible" && !sentinel && !cancelled) {
+    const retryWhenActive = () => {
+      if (document.visibilityState === "visible" && document.hasFocus() && !cancelled) {
         void requestWakeLock();
       }
     };
 
     void requestWakeLock();
-    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", retryWhenActive);
+    window.addEventListener("pageshow", retryWhenActive);
+    document.addEventListener("visibilitychange", retryWhenActive);
 
     return () => {
       cancelled = true;
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.clearTimeout(retryTimer);
+      window.removeEventListener("focus", retryWhenActive);
+      window.removeEventListener("pageshow", retryWhenActive);
+      document.removeEventListener("visibilitychange", retryWhenActive);
+      report("inactive", null);
       void sentinel?.release();
       sentinel = null;
     };
-  }, [enabled]);
+  }, [clientId, enabled, reportWakeLock]);
 }
 
 export default function App() {
@@ -249,7 +295,7 @@ export default function App() {
   const keepaliveIntervalMs = state?.keepalive.intervalMs ?? DEFAULT_KEEPALIVE_INTERVAL_MS;
 
   useKeepalive(clientId, Boolean(savedName), keepaliveIntervalMs);
-  useScreenWakeLock(Boolean(savedName && state?.session?.status === "active"));
+  useScreenWakeLock(clientId, Boolean(savedName && state?.session?.status === "active"));
 
   useEffect(() => {
     if (!savedName || state?.user) {
@@ -886,6 +932,25 @@ function PresenceDot({
   );
 }
 
+function wakeLockAdminNote(presence: AdminPresence | null, session: AdminSession | undefined) {
+  if (!session || session.status !== "active") {
+    return null;
+  }
+  if (!presence) {
+    return null;
+  }
+  if (presence.wakeLockStatus === "failed") {
+    return `Wake lock failed${presence.wakeLockMessage ? `: ${presence.wakeLockMessage}` : ""}`;
+  }
+  if (presence.wakeLockStatus === "unsupported") {
+    return `Wake lock unavailable${presence.wakeLockMessage ? `: ${presence.wakeLockMessage}` : ""}`;
+  }
+  if (presence.wakeLockStatus === "released") {
+    return "Wake lock released by browser or system";
+  }
+  return null;
+}
+
 function UserGroups({ state, token }: { token: string; state: AdminState | undefined }) {
   const approveUser = useMutation(api.game.approveUser);
   const users = state?.users ?? [];
@@ -918,15 +983,20 @@ function UserGroups({ state, token }: { token: string; state: AdminState | undef
       <section>
         <h3>Joined</h3>
         {joined.length === 0 ? <p className="muted">None</p> : null}
-        {joined.map((user, index) => (
-          <div className="user-row stacked" key={user._id}>
-            <span className="user-name">
-              <PresenceDot presence={presenceForUser(presences, user._id)} now={now} />
-              {user.name}
-            </span>
-            <small>{adminUserStatus(user._id, index, joined.length, session, entries)}</small>
-          </div>
-        ))}
+        {joined.map((user, index) => {
+          const presence = presenceForUser(presences, user._id);
+          const wakeLockNote = wakeLockAdminNote(presence, session);
+          return (
+            <div className="user-row stacked" key={user._id}>
+              <span className="user-name">
+                <PresenceDot presence={presence} now={now} />
+                {user.name}
+              </span>
+              <small>{adminUserStatus(user._id, index, joined.length, session, entries)}</small>
+              {wakeLockNote ? <small className="wake-lock-warning">{wakeLockNote}</small> : null}
+            </div>
+          );
+        })}
       </section>
     </div>
   );

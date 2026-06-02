@@ -7,11 +7,13 @@ const DEFAULT_KEEPALIVE_TIMEOUT_MS = 2 * 60 * 1000;
 const KEEPALIVES_PER_TIMEOUT = 5;
 const MIN_KEEPALIVE_TIMEOUT_MS = 15 * 1000;
 const MAX_KEEPALIVE_TIMEOUT_MS = 30 * 60 * 1000;
+const MAX_WAKE_LOCK_MESSAGE_LENGTH = 160;
 
 type SessionDoc = Doc<"sessions">;
 type EntryDoc = Doc<"entries">;
 type UserDoc = Doc<"users">;
 type PresenceDoc = Doc<"presences">;
+type WakeLockStatus = "unknown" | "active" | "unsupported" | "failed" | "released" | "inactive";
 
 type OutputSegment = {
   text: string;
@@ -143,11 +145,15 @@ function presenceByUserId(presences: PresenceDoc[]) {
 function presenceViewsForUsers(users: UserDoc[], presences: PresenceDoc[], timeoutMs: number, now: number) {
   const presenceMap = presenceByUserId(presences);
   return users.map((user) => {
-    const lastSeen = presenceMap.get(user._id)?.lastSeen ?? null;
+    const presence = presenceMap.get(user._id);
+    const lastSeen = presence?.lastSeen ?? null;
     return {
       userId: user._id,
       lastSeen,
       status: presenceStatus(lastSeen, timeoutMs, now),
+      wakeLockStatus: presence?.wakeLockStatus ?? "unknown",
+      wakeLockMessage: presence?.wakeLockMessage ?? null,
+      wakeLockUpdatedAt: presence?.wakeLockUpdatedAt ?? null,
     };
   });
 }
@@ -163,6 +169,10 @@ function isUserActive(
 
 function userName(userNameById: Map<Id<"users">, string>, userId: Id<"users">) {
   return userNameById.get(userId) ?? "Unknown participant";
+}
+
+function cleanWakeLockMessage(message: string | null) {
+  return message ? message.trim().replace(/\s+/g, " ").slice(0, MAX_WAKE_LOCK_MESSAGE_LENGTH) : null;
 }
 
 async function upsertPresence(
@@ -184,6 +194,9 @@ async function upsertPresence(
     userId: user._id,
     clientId: user.clientId,
     lastSeen: now,
+    wakeLockStatus: "unknown",
+    wakeLockMessage: null,
+    wakeLockUpdatedAt: now,
   });
 }
 
@@ -809,6 +822,56 @@ export const heartbeat = mutation({
       timeoutMs,
       intervalMs: keepaliveIntervalMs(timeoutMs),
     };
+  },
+});
+
+export const reportWakeLock = mutation({
+  args: {
+    clientId: v.string(),
+    status: v.union(
+      v.literal("active"),
+      v.literal("unsupported"),
+      v.literal("failed"),
+      v.literal("released"),
+      v.literal("inactive"),
+    ),
+    message: v.union(v.string(), v.null()),
+  },
+  handler: async (ctx, args) => {
+    const user = await ctx.db
+      .query("users")
+      .withIndex("by_clientId", (q) => q.eq("clientId", args.clientId))
+      .unique();
+    if (!user) {
+      return;
+    }
+
+    const now = Date.now();
+    const existing = await ctx.db
+      .query("presences")
+      .withIndex("by_clientId", (q) => q.eq("clientId", args.clientId))
+      .unique();
+    const wakeLockStatus: WakeLockStatus = args.status;
+    const wakeLockMessage = cleanWakeLockMessage(args.message);
+
+    if (existing) {
+      await ctx.db.patch(existing._id, {
+        userId: user._id,
+        wakeLockStatus,
+        wakeLockMessage,
+        wakeLockUpdatedAt: now,
+      });
+      return;
+    }
+
+    await ctx.db.insert("presences", {
+      userId: user._id,
+      clientId: args.clientId,
+      lastSeen: now,
+      wakeLockStatus,
+      wakeLockMessage,
+      wakeLockUpdatedAt: now,
+    });
   },
 });
 
