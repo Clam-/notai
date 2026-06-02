@@ -904,6 +904,68 @@ export const approveUser = mutation({
   },
 });
 
+export const kickUser = mutation({
+  args: { adminToken: v.string(), userId: v.id("users") },
+  handler: async (ctx, args) => {
+    await requireAdmin(ctx, args.adminToken);
+    const user = await ctx.db.get(args.userId);
+    if (!user) {
+      return;
+    }
+    const session = await ctx.db
+      .query("sessions")
+      .withIndex("by_key", (q) => q.eq("key", SESSION_KEY))
+      .unique();
+    const joinedUsersBeforeKick =
+      session?.status === "active" && session.mode === "followMe" && user.status === "joined"
+        ? await listJoinedUsers(ctx)
+        : [];
+    const currentUserBeforeKick =
+      joinedUsersBeforeKick.length > 0
+        ? joinedUsersBeforeKick[session!.turnIndex % joinedUsersBeforeKick.length]
+        : null;
+    const kickedUserIndex = joinedUsersBeforeKick.findIndex((joinedUser) => joinedUser._id === user._id);
+
+    const entries = await ctx.db
+      .query("entries")
+      .withIndex("by_userId_and_roundNumber", (q) => q.eq("userId", args.userId))
+      .collect();
+    await Promise.all(entries.map((entry) => ctx.db.delete(entry._id)));
+
+    const presence = await ctx.db
+      .query("presences")
+      .withIndex("by_userId", (q) => q.eq("userId", args.userId))
+      .unique();
+    if (presence) {
+      await ctx.db.delete(presence._id);
+    }
+
+    await ctx.db.delete(user._id);
+
+    if (session?.status === "active" && session.mode === "followMe" && user.status === "joined") {
+      const joinedUsers = await listJoinedUsers(ctx);
+      if (joinedUsers.length === 0) {
+        await ctx.db.patch(session._id, { turnIndex: 0 });
+        return;
+      }
+
+      if (currentUserBeforeKick && currentUserBeforeKick._id !== user._id) {
+        const currentTurnIndex = joinedUsers.findIndex(
+          (joinedUser) => joinedUser._id === currentUserBeforeKick._id,
+        );
+        await ctx.db.patch(session._id, {
+          turnIndex: currentTurnIndex >= 0 ? currentTurnIndex : session.turnIndex % joinedUsers.length,
+        });
+        return;
+      }
+
+      await ctx.db.patch(session._id, {
+        turnIndex: kickedUserIndex >= 0 ? kickedUserIndex % joinedUsers.length : session.turnIndex % joinedUsers.length,
+      });
+    }
+  },
+});
+
 export const configureKeepalive = mutation({
   args: { adminToken: v.string(), timeoutMs: v.number() },
   handler: async (ctx, args) => {
