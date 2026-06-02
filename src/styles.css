@@ -122,6 +122,7 @@ label {
 .game-panel,
 .status-panel,
 .setup-panel,
+.settings-panel,
 .live-summary,
 .empty-admin {
   width: min(560px, 100%);
@@ -176,6 +177,12 @@ label {
   margin: 0;
   color: #b3261e;
   font-weight: 700;
+}
+
+.success {
+  margin: 0;
+  color: #177c75;
+  font-weight: 800;
 }
 
 .muted {
@@ -289,6 +296,12 @@ label {
 }
 
 .user-rail {
+  position: sticky;
+  top: 75px;
+  display: grid;
+  grid-template-rows: minmax(0, 1fr) auto;
+  height: calc(100vh - 75px);
+  overflow: hidden;
   border-right: 1px solid #d7dde5;
   background: #f0f5f5;
   padding: 20px;
@@ -296,7 +309,10 @@ label {
 
 .user-groups {
   display: grid;
+  align-content: start;
   gap: 24px;
+  min-height: 0;
+  overflow: auto;
 }
 
 .user-groups h2,
@@ -324,6 +340,34 @@ label {
   font-weight: 800;
 }
 
+.user-name {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 8px;
+}
+
+.presence-dot {
+  width: 11px;
+  height: 11px;
+  flex: 0 0 11px;
+  border: 1px solid rgba(29, 36, 48, 0.28);
+  border-radius: 50%;
+  box-shadow: 0 0 0 3px rgba(29, 36, 48, 0.05);
+}
+
+.presence-online {
+  background: #2f9e44;
+}
+
+.presence-idle {
+  background: #f0b429;
+}
+
+.presence-offline {
+  background: #d6453d;
+}
+
 .admin-workspace {
   display: grid;
   align-content: start;
@@ -338,10 +382,29 @@ label {
 }
 
 .setup-panel,
+.settings-panel,
 .live-summary,
 .empty-admin {
   width: 100%;
   box-shadow: none;
+}
+
+.settings-panel {
+  grid-template-columns: minmax(180px, 260px) auto;
+  align-items: end;
+}
+
+.user-rail .settings-panel {
+  grid-template-columns: 1fr;
+  align-items: stretch;
+  margin-top: 20px;
+  padding: 16px;
+}
+
+.settings-note {
+  margin: 0;
+  color: #526174;
+  font-weight: 800;
 }
 
 .range-readout {
@@ -356,13 +419,26 @@ label {
   gap: 12px;
 }
 
+.summary-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.summary-preview {
+  display: grid;
+  gap: 8px;
+}
+
 .icon-button {
   width: 42px;
   height: 42px;
   display: grid;
   place-items: center;
   padding: 0;
-  font-size: 18px;
+}
+
+.icon-button svg {
+  display: block;
 }
 
 .icon-button[aria-pressed="true"] {
@@ -504,8 +580,15 @@ label {
   }
 
   .user-rail {
+    position: static;
+    height: auto;
+    overflow: visible;
     border-right: 0;
     border-bottom: 1px solid #d7dde5;
+  }
+
+  .user-groups {
+    overflow: visible;
   }
 
   .admin-titlebar {

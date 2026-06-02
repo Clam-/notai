@@ -5,10 +5,15 @@ import type { Doc, Id } from "./_generated/dataModel";
 declare const process: { env: { ADMIN_PASSWORD?: string } };
 
 const SESSION_KEY = "main";
+const DEFAULT_KEEPALIVE_TIMEOUT_MS = 2 * 60 * 1000;
+const KEEPALIVES_PER_TIMEOUT = 5;
+const MIN_KEEPALIVE_TIMEOUT_MS = 15 * 1000;
+const MAX_KEEPALIVE_TIMEOUT_MS = 30 * 60 * 1000;
 
 type SessionDoc = Doc<"sessions">;
 type EntryDoc = Doc<"entries">;
 type UserDoc = Doc<"users">;
+type PresenceDoc = Doc<"presences">;
 
 type OutputSegment = {
   text: string;
@@ -45,6 +50,7 @@ async function getSession(ctx: MutationCtx): Promise<SessionDoc> {
     showToAll: false,
     turnIndex: 0,
     endedOutput: "",
+    keepaliveTimeoutMs: DEFAULT_KEEPALIVE_TIMEOUT_MS,
   });
   const session = await ctx.db.get(id);
   if (!session) {
@@ -88,8 +94,91 @@ function cleanSeedKind(kind: string): SeedKind {
   return kind === "topic" ? "topic" : "startingWord";
 }
 
+function sessionKeepaliveTimeoutMs(session: Pick<SessionDoc, "keepaliveTimeoutMs"> | null | undefined) {
+  return session?.keepaliveTimeoutMs ?? DEFAULT_KEEPALIVE_TIMEOUT_MS;
+}
+
+function keepaliveIntervalMs(timeoutMs: number) {
+  return Math.max(1000, Math.floor(timeoutMs / KEEPALIVES_PER_TIMEOUT));
+}
+
+function clampKeepaliveTimeoutMs(timeoutMs: number) {
+  if (!Number.isFinite(timeoutMs)) {
+    return DEFAULT_KEEPALIVE_TIMEOUT_MS;
+  }
+  return Math.max(
+    MIN_KEEPALIVE_TIMEOUT_MS,
+    Math.min(MAX_KEEPALIVE_TIMEOUT_MS, Math.round(timeoutMs)),
+  );
+}
+
+function presenceStatus(
+  lastSeen: number | null,
+  timeoutMs: number,
+  now: number,
+): "online" | "idle" | "offline" {
+  if (lastSeen === null) {
+    return "offline";
+  }
+  const age = now - lastSeen;
+  if (age >= timeoutMs) {
+    return "offline";
+  }
+  if (age >= keepaliveIntervalMs(timeoutMs) * 2) {
+    return "idle";
+  }
+  return "online";
+}
+
+function presenceByUserId(presences: PresenceDoc[]) {
+  return new Map(presences.map((presence) => [presence.userId, presence]));
+}
+
+function presenceViewsForUsers(users: UserDoc[], presences: PresenceDoc[], timeoutMs: number, now: number) {
+  const presenceMap = presenceByUserId(presences);
+  return users.map((user) => {
+    const lastSeen = presenceMap.get(user._id)?.lastSeen ?? null;
+    return {
+      userId: user._id,
+      lastSeen,
+      status: presenceStatus(lastSeen, timeoutMs, now),
+    };
+  });
+}
+
+function isUserActive(
+  user: UserDoc,
+  presenceByUser: Map<Id<"users">, PresenceDoc>,
+  timeoutMs: number,
+  now: number,
+) {
+  return presenceStatus(presenceByUser.get(user._id)?.lastSeen ?? null, timeoutMs, now) !== "offline";
+}
+
 function userName(userNameById: Map<Id<"users">, string>, userId: Id<"users">) {
   return userNameById.get(userId) ?? "Unknown participant";
+}
+
+async function upsertPresence(
+  ctx: MutationCtx,
+  user: Pick<UserDoc, "_id" | "clientId">,
+  now: number,
+) {
+  const existing = await ctx.db
+    .query("presences")
+    .withIndex("by_clientId", (q) => q.eq("clientId", user.clientId))
+    .unique();
+
+  if (existing) {
+    await ctx.db.patch(existing._id, { userId: user._id, lastSeen: now });
+    return;
+  }
+
+  await ctx.db.insert("presences", {
+    userId: user._id,
+    clientId: user.clientId,
+    lastSeen: now,
+  });
 }
 
 async function entriesForUserRound(
@@ -133,6 +222,10 @@ function namesForWinningWord(
     .filter((entry) => entry.words.some((word) => word.trim().toLocaleLowerCase() === key))
     .map((entry) => userName(userNameById, entry.userId));
   return [...new Set(names)];
+}
+
+function wordCountForEntry(entry: EntryDoc) {
+  return (entry.text || entry.words.join(" ")).trim().split(/\s+/).filter(Boolean).length;
 }
 
 function winningEntryForRound(entries: EntryDoc[]) {
@@ -221,8 +314,13 @@ async function outputSegmentsForSession(
   ctx: QueryCtx,
   session: SessionDoc | null,
 ): Promise<OutputSegment[]> {
-  const output = session?.endedOutput.trim();
-  if (!session || session.status !== "ended" || !output) {
+  const output =
+    session?.status === "ended"
+      ? session.endedOutput.trim()
+      : session?.status === "active"
+        ? session.context.trim()
+        : "";
+  if (!session || !output) {
     return [];
   }
 
@@ -262,12 +360,13 @@ async function outputSegmentsForSession(
     segments.push(
       ...followEntries.map((entry): OutputSegment => {
         const author = userName(userNameById, entry.userId);
+        const wordCount = wordCountForEntry(entry);
         return {
           text: entry.text || entry.words.join(" "),
           roundNumber: entry.roundNumber,
           mode: "followMe",
           authors: [author],
-          summary: `Round ${entry.roundNumber}: added by ${author}`,
+          summary: `Round ${entry.roundNumber}: ${wordCount} ${wordCount === 1 ? "word" : "words"} added by ${author}`,
         };
       }),
     );
@@ -299,12 +398,15 @@ async function outputSegmentsForSession(
       );
       const authors = namesForWinningWord(roundEntries, winner.word, userNameById);
       const authorText = authors.length > 0 ? authors.join(", ") : "Unknown participant";
+      const matchingEntries = roundEntries.filter((entry) =>
+        entry.words.some((word) => word.trim().toLocaleLowerCase() === winner.word.toLocaleLowerCase()),
+      ).length;
       segments.push({
         text: winner.word,
         roundNumber: winner.roundNumber,
         mode: "nextWord",
         authors,
-        summary: `Round ${winner.roundNumber}: winning word submitted by ${authorText}`,
+        summary: `Round ${winner.roundNumber}: winning word submitted by ${authorText}; ${matchingEntries}/${roundEntries.length} matching`,
       });
     });
 
@@ -314,7 +416,7 @@ async function outputSegmentsForSession(
   return [];
 }
 
-async function listJoinedUsers(ctx: MutationCtx) {
+async function listJoinedUsers(ctx: QueryCtx | MutationCtx) {
   const users = await ctx.db.query("users").collect();
   return users
     .filter((user) => user.status === "joined")
@@ -323,6 +425,13 @@ async function listJoinedUsers(ctx: MutationCtx) {
       const joinedB = b.joinedAt ?? b._creationTime;
       return joinedA - joinedB;
     });
+}
+
+async function activeJoinedUsers(ctx: MutationCtx, session: SessionDoc, joinedUsers: UserDoc[]) {
+  const timeoutMs = sessionKeepaliveTimeoutMs(session);
+  const now = Date.now();
+  const presenceMap = presenceByUserId(await ctx.db.query("presences").collect());
+  return joinedUsers.filter((user) => isUserActive(user, presenceMap, timeoutMs, now));
 }
 
 async function advanceNextWordRound(ctx: MutationCtx, session: SessionDoc) {
@@ -369,10 +478,83 @@ async function advanceFollowMeTurn(ctx: MutationCtx, session: SessionDoc) {
   if (joinedUsers.length === 0) {
     return;
   }
+  const activeUsers = await activeJoinedUsers(ctx, session, joinedUsers);
+  const queue = activeUsers.length > 0 ? activeUsers : joinedUsers;
+  const currentUser = joinedUsers[session.turnIndex % joinedUsers.length];
+  const currentQueueIndex = currentUser
+    ? queue.findIndex((user) => user._id === currentUser._id)
+    : -1;
+  const nextQueueIndex = currentQueueIndex >= 0 ? currentQueueIndex + 1 : 0;
+  const nextUser = queue[nextQueueIndex % queue.length];
+  const nextTurnIndex = joinedUsers.findIndex((user) => user._id === nextUser._id);
+
   await ctx.db.patch(session._id, {
-    turnIndex: (session.turnIndex + 1) % joinedUsers.length,
+    turnIndex: nextTurnIndex >= 0 ? nextTurnIndex : 0,
     roundNumber: session.roundNumber + 1,
   });
+}
+
+async function skipTimedOutFollowMeTurn(ctx: MutationCtx, session: SessionDoc) {
+  const joinedUsers = await listJoinedUsers(ctx);
+  if (joinedUsers.length === 0) {
+    return;
+  }
+
+  const activeUsers = await activeJoinedUsers(ctx, session, joinedUsers);
+  if (activeUsers.length === 0) {
+    return;
+  }
+
+  const activeUserIds = new Set(activeUsers.map((user) => user._id));
+  const currentIndex = session.turnIndex % joinedUsers.length;
+  const currentUser = joinedUsers[currentIndex];
+  if (currentUser && activeUserIds.has(currentUser._id)) {
+    return;
+  }
+
+  for (let skipped = 1; skipped <= joinedUsers.length; skipped += 1) {
+    const nextIndex = (currentIndex + skipped) % joinedUsers.length;
+    if (activeUserIds.has(joinedUsers[nextIndex]._id)) {
+      await ctx.db.patch(session._id, {
+        turnIndex: nextIndex,
+        roundNumber: session.roundNumber + skipped,
+      });
+      return;
+    }
+  }
+}
+
+async function maybeAdvanceNextWordRound(ctx: MutationCtx, session: SessionDoc) {
+  const joinedUsers = await listJoinedUsers(ctx);
+  const activeUsers = await activeJoinedUsers(ctx, session, joinedUsers);
+  if (activeUsers.length === 0) {
+    return;
+  }
+
+  const roundEntries = await ctx.db
+    .query("entries")
+    .withIndex("by_roundNumber", (q) => q.eq("roundNumber", session.roundNumber))
+    .collect();
+  const submittedUserIds = new Set(
+    roundEntries
+      .filter((entry) => entry.mode === "nextWord" && entry.words.length >= session.wordsPerRound)
+      .map((entry) => entry.userId),
+  );
+
+  if (activeUsers.every((user) => submittedUserIds.has(user._id))) {
+    await advanceNextWordRound(ctx, session);
+  }
+}
+
+async function skipTimedOutTurns(ctx: MutationCtx, session: SessionDoc) {
+  if (session.status !== "active") {
+    return;
+  }
+  if (session.mode === "followMe") {
+    await skipTimedOutFollowMeTurn(ctx, session);
+  } else if (session.mode === "nextWord") {
+    await maybeAdvanceNextWordRound(ctx, session);
+  }
 }
 
 export const getParticipantState = query({
@@ -385,6 +567,11 @@ export const getParticipantState = query({
     const session = await ctx.db
       .query("sessions")
       .withIndex("by_key", (q) => q.eq("key", SESSION_KEY))
+      .unique();
+    const timeoutMs = sessionKeepaliveTimeoutMs(session);
+    const ownPresence = await ctx.db
+      .query("presences")
+      .withIndex("by_clientId", (q) => q.eq("clientId", args.clientId))
       .unique();
     const users = await ctx.db.query("users").collect();
     const joinedUsers = users
@@ -422,6 +609,11 @@ export const getParticipantState = query({
       isCurrentTurn: Boolean(user && turnUser && turnUser._id === user._id),
       peopleInFront,
       outputSegments,
+      keepalive: {
+        timeoutMs,
+        intervalMs: keepaliveIntervalMs(timeoutMs),
+        lastSeen: ownPresence?.lastSeen ?? null,
+      },
     };
   },
 });
@@ -430,7 +622,17 @@ export const getAdminState = query({
   args: { adminToken: v.union(v.string(), v.null()) },
   handler: async (ctx, args) => {
     if (!args.adminToken) {
-      return { authorized: false, users: [], session: null, entries: [], outputSegments: [] };
+      return {
+        authorized: false,
+        users: [],
+        session: null,
+        entries: [],
+        outputSegments: [],
+        presences: [],
+        now: Date.now(),
+        keepaliveTimeoutMs: DEFAULT_KEEPALIVE_TIMEOUT_MS,
+        keepaliveIntervalMs: keepaliveIntervalMs(DEFAULT_KEEPALIVE_TIMEOUT_MS),
+      };
     }
 
     const adminSession = await ctx.db
@@ -438,7 +640,17 @@ export const getAdminState = query({
       .withIndex("by_token", (q) => q.eq("token", args.adminToken ?? ""))
       .unique();
     if (!adminSession) {
-      return { authorized: false, users: [], session: null, entries: [], outputSegments: [] };
+      return {
+        authorized: false,
+        users: [],
+        session: null,
+        entries: [],
+        outputSegments: [],
+        presences: [],
+        now: Date.now(),
+        keepaliveTimeoutMs: DEFAULT_KEEPALIVE_TIMEOUT_MS,
+        keepaliveIntervalMs: keepaliveIntervalMs(DEFAULT_KEEPALIVE_TIMEOUT_MS),
+      };
     }
 
     const users = await ctx.db.query("users").collect();
@@ -454,17 +666,25 @@ export const getAdminState = query({
       : [];
 
     const outputSegments = await outputSegmentsForSession(ctx, session);
+    const presences = await ctx.db.query("presences").collect();
+    const now = Date.now();
+    const timeoutMs = sessionKeepaliveTimeoutMs(session);
+    const sortedUsers = users.sort((a, b) => {
+      const joinedA = a.joinedAt ?? a._creationTime;
+      const joinedB = b.joinedAt ?? b._creationTime;
+      return joinedA - joinedB;
+    });
 
     return {
       authorized: true,
-      users: users.sort((a, b) => {
-        const joinedA = a.joinedAt ?? a._creationTime;
-        const joinedB = b.joinedAt ?? b._creationTime;
-        return joinedA - joinedB;
-      }),
+      users: sortedUsers,
       session,
       entries,
       outputSegments,
+      presences: presenceViewsForUsers(sortedUsers as UserDoc[], presences, timeoutMs, now),
+      now,
+      keepaliveTimeoutMs: timeoutMs,
+      keepaliveIntervalMs: keepaliveIntervalMs(timeoutMs),
     };
   },
 });
@@ -485,15 +705,43 @@ export const join = mutation({
 
     if (existing) {
       await ctx.db.patch(existing._id, { name });
+      await upsertPresence(ctx, existing, Date.now());
       return existing._id;
     }
 
-    return await ctx.db.insert("users", {
+    const userId = await ctx.db.insert("users", {
       clientId: args.clientId,
       name,
       status: "waiting",
       joinedAt: null,
     });
+    await upsertPresence(ctx, { _id: userId, clientId: args.clientId }, Date.now());
+    return userId;
+  },
+});
+
+export const heartbeat = mutation({
+  args: { clientId: v.string() },
+  handler: async (ctx, args) => {
+    const session = await getSession(ctx);
+    const user = await ctx.db
+      .query("users")
+      .withIndex("by_clientId", (q) => q.eq("clientId", args.clientId))
+      .unique();
+    if (user) {
+      await upsertPresence(ctx, user, Date.now());
+    }
+
+    const latestSession = await ctx.db.get(session._id);
+    if (latestSession) {
+      await skipTimedOutTurns(ctx, latestSession);
+    }
+
+    const timeoutMs = sessionKeepaliveTimeoutMs(latestSession ?? session);
+    return {
+      timeoutMs,
+      intervalMs: keepaliveIntervalMs(timeoutMs),
+    };
   },
 });
 
@@ -523,6 +771,20 @@ export const approveUser = mutation({
   handler: async (ctx, args) => {
     await requireAdmin(ctx, args.adminToken);
     await ctx.db.patch(args.userId, { status: "joined", joinedAt: Date.now() });
+  },
+});
+
+export const configureKeepalive = mutation({
+  args: { adminToken: v.string(), timeoutMs: v.number() },
+  handler: async (ctx, args) => {
+    await requireAdmin(ctx, args.adminToken);
+    const session = await getSession(ctx);
+    const timeoutMs = clampKeepaliveTimeoutMs(args.timeoutMs);
+    await ctx.db.patch(session._id, { keepaliveTimeoutMs: timeoutMs });
+    return {
+      timeoutMs,
+      intervalMs: keepaliveIntervalMs(timeoutMs),
+    };
   },
 });
 
@@ -606,10 +868,11 @@ export const submitNextWord = mutation({
     if (!user || user.status !== "joined") {
       throw new Error("You are not joined");
     }
+    await upsertPresence(ctx, user, Date.now());
 
-    const cleanedWords = args.words
+    const submittedWords = args.words.length > 0 ? args.words : [""];
+    const cleanedWords = submittedWords
       .map((word) => word.trim())
-      .filter(Boolean)
       .slice(0, session.wordsPerRound);
 
     const [existing, ...duplicateEntries] = await entriesForUserRound(
@@ -620,7 +883,7 @@ export const submitNextWord = mutation({
     );
     await deleteEntries(ctx, duplicateEntries);
 
-    const existingWords = existing?.words.map((word) => word.trim()).filter(Boolean) ?? [];
+    const existingWords = existing?.words.map((word) => word.trim()) ?? [];
     if (existingWords.length >= session.wordsPerRound) {
       throw new Error("All words submitted");
     }
@@ -630,9 +893,6 @@ export const submitNextWord = mutation({
         ? [...existingWords, cleanedWords[0]]
         : cleanedWords;
     const limitedWords = nextWords.slice(0, session.wordsPerRound);
-    if (limitedWords.length === 0) {
-      throw new Error("Enter at least one word");
-    }
 
     if (existing) {
       await ctx.db.patch(existing._id, { words: limitedWords, text: "" });
@@ -646,23 +906,7 @@ export const submitNextWord = mutation({
       });
     }
 
-    const joinedUsers = await listJoinedUsers(ctx);
-    const roundEntries = await ctx.db
-      .query("entries")
-      .withIndex("by_roundNumber", (q) => q.eq("roundNumber", session.roundNumber))
-      .collect();
-    const submittedUserIds = new Set(
-      roundEntries
-        .filter((entry) => entry.mode === "nextWord" && entry.words.length >= session.wordsPerRound)
-        .map((entry) => entry.userId),
-    );
-
-    if (
-      joinedUsers.length > 0 &&
-      joinedUsers.every((joinedUser) => submittedUserIds.has(joinedUser._id))
-    ) {
-      await advanceNextWordRound(ctx, session);
-    }
+    await maybeAdvanceNextWordRound(ctx, session);
   },
 });
 
@@ -681,9 +925,12 @@ export const submitFollowMe = mutation({
     if (!user || user.status !== "joined") {
       throw new Error("You are not joined");
     }
+    await upsertPresence(ctx, user, Date.now());
+    await skipTimedOutTurns(ctx, session);
 
+    const currentSession = (await ctx.db.get(session._id)) ?? session;
     const joinedUsers = await listJoinedUsers(ctx);
-    const currentUser = joinedUsers[session.turnIndex % joinedUsers.length];
+    const currentUser = joinedUsers[currentSession.turnIndex % joinedUsers.length];
     if (!currentUser || currentUser._id !== user._id) {
       throw new Error("It is not your turn");
     }
@@ -692,20 +939,22 @@ export const submitFollowMe = mutation({
     if (words.length === 0) {
       throw new Error("Enter at least one word");
     }
-    if (words.length > session.wordsEnteredPerRound) {
+    if (words.length > currentSession.wordsEnteredPerRound) {
       throw new Error("Too many words");
     }
 
     await ctx.db.insert("entries", {
-      roundNumber: session.roundNumber,
+      roundNumber: currentSession.roundNumber,
       mode: "followMe",
       userId: user._id,
       words,
       text: words.join(" "),
     });
-    await ctx.db.patch(session._id, { context: appendContext(session.context, words.join(" ")) });
+    await ctx.db.patch(currentSession._id, {
+      context: appendContext(currentSession.context, words.join(" ")),
+    });
 
-    const latestSession = await ctx.db.get(session._id);
+    const latestSession = await ctx.db.get(currentSession._id);
     if (latestSession) {
       await advanceFollowMeTurn(ctx, latestSession);
     }
@@ -746,6 +995,8 @@ export const resetSession = mutation({
     await Promise.all(users.map((user) => ctx.db.delete(user._id)));
     const entries = await ctx.db.query("entries").collect();
     await Promise.all(entries.map((entry) => ctx.db.delete(entry._id)));
+    const presences = await ctx.db.query("presences").collect();
+    await Promise.all(presences.map((presence) => ctx.db.delete(presence._id)));
     const session = await getSession(ctx);
     await ctx.db.patch(session._id, {
       status: "idle",
@@ -761,6 +1012,7 @@ export const resetSession = mutation({
       showToAll: false,
       turnIndex: 0,
       endedOutput: "",
+      keepaliveTimeoutMs: DEFAULT_KEEPALIVE_TIMEOUT_MS,
     });
   },
 });

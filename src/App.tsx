@@ -6,13 +6,24 @@ import type { Id } from "../convex/_generated/dataModel";
 const CLIENT_ID_KEY = "notai.clientId";
 const NAME_KEY = "notai.name";
 const ADMIN_TOKEN_KEY = "notai.adminToken";
+const DEFAULT_KEEPALIVE_INTERVAL_MS = 24 * 1000;
 
 type ParticipantState = NonNullable<ReturnType<typeof useQuery<typeof api.game.getParticipantState>>>;
 type AdminState = NonNullable<ReturnType<typeof useQuery<typeof api.game.getAdminState>>>;
 type AdminSession = AdminState["session"];
 type AdminEntry = AdminState["entries"][number];
+type AdminPresence = AdminState["presences"][number];
 type OutputSegment = ParticipantState["outputSegments"][number] | AdminState["outputSegments"][number];
 type SeedKind = "startingWord" | "topic";
+type WakeLockSentinel = EventTarget & {
+  released: boolean;
+  release: () => Promise<void>;
+};
+type NavigatorWithWakeLock = Navigator & {
+  wakeLock?: {
+    request: (type: "screen") => Promise<WakeLockSentinel>;
+  };
+};
 
 function getClientId() {
   const existing = localStorage.getItem(CLIENT_ID_KEY);
@@ -78,12 +89,103 @@ function oneLineInput(text: string) {
   return text.replace(/[\r\n]+/g, " ");
 }
 
+function useKeepalive(clientId: string, enabled: boolean, intervalMs: number) {
+  const heartbeat = useMutation(api.game.heartbeat);
+
+  useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+
+    let cancelled = false;
+    let timer: number | undefined;
+    const schedule = (delayMs: number) => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(ping, Math.max(1000, delayMs));
+    };
+    const ping = async () => {
+      try {
+        const result = await heartbeat({ clientId });
+        if (!cancelled) {
+          schedule(result.intervalMs);
+        }
+      } catch {
+        if (!cancelled) {
+          schedule(intervalMs);
+        }
+      }
+    };
+    const pingNow = () => {
+      if (!cancelled) {
+        void ping();
+      }
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        pingNow();
+      }
+    };
+
+    pingNow();
+    window.addEventListener("focus", pingNow);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      window.removeEventListener("focus", pingNow);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [clientId, enabled, heartbeat, intervalMs]);
+}
+
+function useScreenWakeLock(enabled: boolean) {
+  useEffect(() => {
+    if (!enabled) {
+      return;
+    }
+
+    let cancelled = false;
+    let sentinel: WakeLockSentinel | null = null;
+    const requestWakeLock = async () => {
+      const wakeLock = (navigator as NavigatorWithWakeLock).wakeLock;
+      if (!wakeLock || document.visibilityState !== "visible") {
+        return;
+      }
+      try {
+        sentinel = await wakeLock.request("screen");
+      } catch {
+        sentinel = null;
+      }
+    };
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible" && !sentinel && !cancelled) {
+        void requestWakeLock();
+      }
+    };
+
+    void requestWakeLock();
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      cancelled = true;
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      void sentinel?.release();
+      sentinel = null;
+    };
+  }, [enabled]);
+}
+
 export default function App() {
   const [clientId] = useState(getClientId);
   const [savedName, setSavedName] = useState(() => localStorage.getItem(NAME_KEY) ?? "");
   const [adminOpen, setAdminOpen] = useState(false);
   const join = useMutation(api.game.join);
   const state = useQuery(api.game.getParticipantState, { clientId });
+  const keepaliveIntervalMs = state?.keepalive.intervalMs ?? DEFAULT_KEEPALIVE_INTERVAL_MS;
+
+  useKeepalive(clientId, Boolean(savedName), keepaliveIntervalMs);
+  useScreenWakeLock(Boolean(savedName && state?.session?.status === "active"));
 
   useEffect(() => {
     if (!savedName || state?.user) {
@@ -258,10 +360,6 @@ function ParticipantView({
           event.preventDefault();
           setError("");
           const cleaned = nextWordChoice.trim();
-          if (!cleaned) {
-            setError("Enter a word.");
-            return;
-          }
           try {
             await submitNextWord({ clientId, words: [cleaned] });
             setNextWordChoice("");
@@ -393,30 +491,36 @@ function OutputPanel({
       {topic ? <ContextBlock label="Topic" context={topic} /> : null}
       {output ? (
         <h1 className="attributed-output">
-          {visibleSegments.length > 0 ? (
-            visibleSegments.map((segment, index) => (
-              <span className="output-segment-wrap" key={`${segment.roundNumber}-${index}`}>
-                <span
-                  className="output-segment"
-                  tabIndex={0}
-                  aria-label={segment.summary}
-                >
-                  {segment.text}
-                </span>
-                <span className="segment-popup" role="tooltip">
-                  {segment.summary}
-                </span>
-                {index < visibleSegments.length - 1 ? " " : null}
-              </span>
-            ))
-          ) : (
-            output
-          )}
+          <AttributedOutputText output={output} segments={visibleSegments} />
         </h1>
       ) : (
         <h1>No words were entered.</h1>
       )}
     </div>
+  );
+}
+
+function AttributedOutputText({ output, segments }: { output: string; segments: OutputSegment[] }) {
+  const visibleSegments = segments.filter((segment) => segment.text.trim());
+
+  if (visibleSegments.length === 0) {
+    return output;
+  }
+
+  return (
+    <>
+      {visibleSegments.map((segment, index) => (
+        <span className="output-segment-wrap" key={`${segment.roundNumber}-${index}-${segment.text}`}>
+          <span className="output-segment" tabIndex={0} aria-label={segment.summary}>
+            {segment.text}
+          </span>
+          <span className="segment-popup" role="tooltip">
+            {segment.summary}
+          </span>
+          {index < visibleSegments.length - 1 ? " " : null}
+        </span>
+      ))}
+    </>
   );
 }
 
@@ -530,6 +634,7 @@ function DashboardContent({
     <div className="dashboard-grid">
       <aside className="user-rail">
         <UserGroups state={state} token={token} />
+        <KeepaliveSettings token={token} state={state} />
       </aside>
       <section className="admin-workspace">
         <div className="toolbar">
@@ -569,6 +674,47 @@ function DashboardContent({
   );
 }
 
+function presenceForUser(presences: AdminPresence[], userId: string) {
+  return presences.find((presence) => presence.userId === userId) ?? null;
+}
+
+function formatLastSeen(lastSeen: number | null, now: number) {
+  if (lastSeen === null) {
+    return "last seen never";
+  }
+  const ageSeconds = Math.max(0, Math.floor((now - lastSeen) / 1000));
+  if (ageSeconds < 5) {
+    return "last seen just now";
+  }
+  if (ageSeconds < 60) {
+    return `last seen ${ageSeconds} seconds ago`;
+  }
+  const ageMinutes = Math.floor(ageSeconds / 60);
+  if (ageMinutes < 60) {
+    return `last seen ${ageMinutes} ${ageMinutes === 1 ? "minute" : "minutes"} ago`;
+  }
+  const ageHours = Math.floor(ageMinutes / 60);
+  return `last seen ${ageHours} ${ageHours === 1 ? "hour" : "hours"} ago`;
+}
+
+function PresenceDot({
+  presence,
+  now,
+}: {
+  presence: AdminPresence | null;
+  now: number;
+}) {
+  const status = presence?.status ?? "offline";
+  const label = formatLastSeen(presence?.lastSeen ?? null, now);
+  return (
+    <span
+      className={`presence-dot presence-${status}`}
+      aria-label={`${status}, ${label}`}
+      title={label}
+    />
+  );
+}
+
 function UserGroups({ state, token }: { token: string; state: AdminState | undefined }) {
   const approveUser = useMutation(api.game.approveUser);
   const users = state?.users ?? [];
@@ -576,6 +722,8 @@ function UserGroups({ state, token }: { token: string; state: AdminState | undef
   const joined = users.filter((user) => user.status === "joined");
   const session = state?.session;
   const entries = state?.entries ?? [];
+  const presences = state?.presences ?? [];
+  const now = state?.now ?? Date.now();
 
   return (
     <div className="user-groups">
@@ -585,7 +733,8 @@ function UserGroups({ state, token }: { token: string; state: AdminState | undef
         {waiting.length === 0 ? <p className="muted">None</p> : null}
         {waiting.map((user) => (
           <div className="user-row" key={user._id}>
-            <span>
+            <span className="user-name">
+              <PresenceDot presence={presenceForUser(presences, user._id)} now={now} />
               {user.name}
               {user.status === "transitioning" ? " ..." : ""}
             </span>
@@ -600,12 +749,72 @@ function UserGroups({ state, token }: { token: string; state: AdminState | undef
         {joined.length === 0 ? <p className="muted">None</p> : null}
         {joined.map((user, index) => (
           <div className="user-row stacked" key={user._id}>
-            <span>{user.name}</span>
+            <span className="user-name">
+              <PresenceDot presence={presenceForUser(presences, user._id)} now={now} />
+              {user.name}
+            </span>
             <small>{adminUserStatus(user._id, index, joined.length, session, entries)}</small>
           </div>
         ))}
       </section>
     </div>
+  );
+}
+
+function KeepaliveSettings({
+  token,
+  state,
+}: {
+  token: string;
+  state: AdminState | undefined;
+}) {
+  const configureKeepalive = useMutation(api.game.configureKeepalive);
+  const [timeoutSeconds, setTimeoutSeconds] = useState(120);
+  const [saved, setSaved] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    if (state?.keepaliveTimeoutMs) {
+      setTimeoutSeconds(Math.round(state.keepaliveTimeoutMs / 1000));
+    }
+  }, [state?.keepaliveTimeoutMs]);
+
+  return (
+    <form
+      className="settings-panel"
+      onSubmit={async (event) => {
+        event.preventDefault();
+        setError("");
+        setSaved("");
+        try {
+          await configureKeepalive({
+            adminToken: token,
+            timeoutMs: timeoutSeconds * 1000,
+          });
+          setSaved("Saved");
+        } catch (err) {
+          setError(err instanceof Error ? err.message : "Could not save keepalive timeout.");
+        }
+      }}
+    >
+      <label>
+        Keepalive timeout
+        <input
+          type="number"
+          min={15}
+          max={1800}
+          step={5}
+          value={timeoutSeconds}
+          onChange={(event) => setTimeoutSeconds(Number(event.target.value))}
+        />
+      </label>
+      <p className="settings-note">
+        Clients ping every {Math.round((state?.keepaliveIntervalMs ?? DEFAULT_KEEPALIVE_INTERVAL_MS) / 1000)} seconds.
+      </p>
+      {saved ? <p className="success">{saved}</p> : null}
+      {error ? <p className="error">{error}</p> : null}
+      <button className="primary">Save timeout</button>
+    </form>
   );
 }
 
@@ -643,10 +852,87 @@ function adminUserStatus(
   return `${peopleInFront} in queue`;
 }
 
+function EyeIcon({ slash = false }: { slash?: boolean }) {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20" fill="none">
+      <path
+        d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6Z"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      {slash ? (
+        <path
+          d="M4 4l16 16"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+        />
+      ) : null}
+    </svg>
+  );
+}
+
+function CumulativeIcon({ slash = false }: { slash?: boolean }) {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" width="20" height="20" fill="none">
+      <path
+        d="M5 7h14M5 12h14M5 17h14"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+      {slash ? (
+        <path
+          d="M4 4l16 16"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+        />
+      ) : null}
+    </svg>
+  );
+}
+
+function PreviewText({
+  visible,
+  output,
+  segments,
+  emptyText = "No words yet.",
+}: {
+  visible: boolean;
+  output: string;
+  segments: OutputSegment[];
+  emptyText?: string;
+}) {
+  if (!visible) {
+    return <>Progress hidden</>;
+  }
+
+  if (!output.trim()) {
+    return <>{emptyText}</>;
+  }
+
+  return <AttributedOutputText output={output} segments={segments} />;
+}
+
 function LiveAdminSummary({ session, state }: { session: AdminSession; state: AdminState | undefined }) {
-  const [progressVisible, setProgressVisible] = useState(false);
+  const [currentVisible, setCurrentVisible] = useState(false);
+  const [cumulativeVisible, setCumulativeVisible] = useState(false);
   const joined = state?.users.filter((user) => user.status === "joined") ?? [];
   const entries = state?.entries ?? [];
+  const outputSegments = state?.outputSegments ?? [];
+  const activeJoined = joined.filter(
+    (user) => (presenceForUser(state?.presences ?? [], user._id)?.status ?? "offline") !== "offline",
+  );
 
   if (!session) {
     return null;
@@ -654,34 +940,81 @@ function LiveAdminSummary({ session, state }: { session: AdminSession; state: Ad
 
   const ready =
     session.mode === "nextWord"
-      ? entries.filter((entry) => entry.mode === "nextWord" && entry.words.length >= session.wordsPerRound).length
+      ? activeJoined.filter((user) =>
+          entries.some(
+            (entry) =>
+              entry.userId === user._id &&
+              entry.mode === "nextWord" &&
+              entry.words.length >= session.wordsPerRound,
+          ),
+        ).length
       : entries.length;
 
   return (
     <div className="live-summary">
       <div className="summary-header">
         <p className="eyebrow">{session.mode === "nextWord" ? "Next Word" : "Follow me"}</p>
-        <button
-          className="icon-button"
-          type="button"
-          aria-label={progressVisible ? "Hide current progress" : "Show current progress"}
-          aria-pressed={progressVisible}
-          title={progressVisible ? "Hide current progress" : "Show current progress"}
-          onClick={() => setProgressVisible((visible) => !visible)}
-        >
-          <span aria-hidden="true">&#128065;</span>
-        </button>
+        <div className="summary-actions">
+          {session.mode === "nextWord" ? (
+            <button
+              className="icon-button"
+              type="button"
+              aria-label={currentVisible ? "Hide current" : "Show current"}
+              aria-pressed={currentVisible}
+              title={currentVisible ? "Hide current" : "Show current"}
+              onClick={() => setCurrentVisible((visible) => !visible)}
+            >
+              <EyeIcon slash={!currentVisible} />
+            </button>
+          ) : null}
+          <button
+            className="icon-button"
+            type="button"
+            aria-label={cumulativeVisible ? "Hide current cumulative" : "Show current cumulative"}
+            aria-pressed={cumulativeVisible}
+            title={cumulativeVisible ? "Hide current cumulative" : "Show current cumulative"}
+            onClick={() => setCumulativeVisible((visible) => !visible)}
+          >
+            {session.mode === "nextWord" ? (
+              <CumulativeIcon slash={!cumulativeVisible} />
+            ) : (
+              <EyeIcon slash={!cumulativeVisible} />
+            )}
+          </button>
+        </div>
       </div>
       {session.mode === "nextWord" ? (
         <>
-          <h1>{progressVisible ? nextWordPrompt(session).text : "Progress hidden"}</h1>
+          <div className="summary-preview">
+            <p className="eyebrow">{nextWordPrompt(session).label}</p>
+            <h1>{currentVisible ? nextWordPrompt(session).text : "Progress hidden"}</h1>
+          </div>
+          <div className="summary-preview">
+            <p className="eyebrow">Current cumulative</p>
+            <h1 className="attributed-output">
+              <PreviewText
+                visible={cumulativeVisible}
+                output={session.context}
+                segments={outputSegments}
+              />
+            </h1>
+          </div>
           <p>
-            {ready}/{joined.length} ready
+            {ready}/{activeJoined.length} online ready
           </p>
         </>
       ) : (
         <>
-          <h1>{progressVisible ? session.context || "No words yet." : "Progress hidden"}</h1>
+          <div className="summary-preview">
+            <p className="eyebrow">Current cumulative</p>
+            <h1 className="attributed-output">
+              <PreviewText
+                visible={cumulativeVisible}
+                output={session.context}
+                segments={outputSegments}
+              />
+            </h1>
+          </div>
           <p>Round {session.roundNumber}</p>
         </>
       )}

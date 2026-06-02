@@ -30,6 +30,7 @@ export default defineSchema({
     showToAll: v.boolean(),
     turnIndex: v.number(),
     endedOutput: v.string(),
+    keepaliveTimeoutMs: v.optional(v.number()),
   }).index("by_key", ["key"]),
 
   entries: defineTable({
@@ -46,4 +47,12 @@ export default defineSchema({
     token: v.string(),
     createdAt: v.number(),
   }).index("by_token", ["token"]),
+
+  presences: defineTable({
+    userId: v.id("users"),
+    clientId: v.string(),
+    lastSeen: v.number(),
+  })
+    .index("by_userId", ["userId"])
+    .index("by_clientId", ["clientId"]),
 });
